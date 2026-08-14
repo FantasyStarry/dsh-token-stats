@@ -31,6 +31,10 @@
      - 最近 7 天：纯 CSS 迷你柱状图（带图例，hover 看完整数字）+ 逐日表；
   3. `/usage` 命令：对话中输入 `/usage` 直接查看今日用量（缩写 + 子代理对账行，
      结果渲染为对话流节点）。
+- **设置页"插件配置"表单（v0.4.0）**：`设置 → 插件` 页出现 token-stats 卡片，
+  可修改 `storagePath` / `keepDays`，保存即实时生效（改路径会先把旧数据落盘，
+  再在新路径从日志重建今天）。统计面板本身在 `设置 → 用量统计`（插件页不展示
+  统计内容，那是独立的 settings 分区）。
 - **HTTP API**（同源，供客户端插件使用）：
   - `GET /token-stats/summary?day=YYYY-MM-DD`（默认今天）
   - `GET /token-stats/history?days=N`（默认 7，上限 30）
@@ -41,7 +45,7 @@
 从 GitHub 安装（推荐，锁定版本标签）：
 
 ```bash
-dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.2.0"
+dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.4.0"
 ```
 
 本地源码安装（开发调试）：
@@ -65,7 +69,7 @@ dsh plugin --profile web add "file:C:/path/to/dsh-token-stats"
 > 读文件的，同步后**刷新浏览器**即生效；服务端（`index.js`）需要**重启 dsh web**。
 
 升级插件：改代码 → 提交推送 → 打新标签（如 `v0.2.0`）→
-`dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.2.0"` → 重启 `dsh web`。
+`dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.4.0"` → 重启 `dsh web`。
 
 > **注意（v0.1.0 已知问题，v0.1.1 修复）**：DSH 会话日志（`session.jsonl.zstd`）是
 > **多帧 zstd 容器**——每批事件追加一个独立压缩帧。v0.1.0 的回填用

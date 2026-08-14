@@ -16,14 +16,46 @@ const makeCtx = () => {
   const routes = [];
   const commands = [];
   const handlers = {};
+  const settingsScopes = [];
   return {
     routes,
     commands,
+    handlers,
+    settingsScopes,
     ctx: {
       on: (name, fn) => {
         (handlers[name] ??= []).push(fn);
       },
       inject: (services, cb) => {
+        if (services.includes("settings")) {
+          // mock settings 服务：记录注册的 scope，测试可手动触发 watch
+          const scope = {
+            value: {},
+            ns: "",
+            schema: null,
+            watchFn: null,
+            get: () => scope.value,
+            watch: (fn) => {
+              scope.watchFn = fn;
+            }
+          };
+          settingsScopes.push(scope);
+          cb({
+            settings: {
+              register: (ns, schema, opts) => {
+                scope.ns = ns;
+                scope.schema = schema;
+                scope.value = { ...opts.base };
+                return scope;
+              }
+            },
+            effect: (fn) => {
+              fn();
+              return () => {};
+            }
+          });
+          return;
+        }
         cb({
           webServer: {
             register: (route) => {
@@ -39,9 +71,9 @@ const makeCtx = () => {
           }
         });
       },
-      logger: { info: (...a) => console.log("[ctx:info]", ...a), warn: (...a) => console.log("[ctx:warn]", ...a) }
+      logger: { info: (...a) => console.log("[ctx:info]", ...a), warn: (...a) => console.log("[ctx:warn]", ...a) },
+      fiber: { state: "ready" }
     },
-    handlers,
     emit: (sessionOrEv, ev) => {
       const session = ev === undefined ? { id: "s" } : sessionOrEv;
       const event = ev === undefined ? sessionOrEv : ev;
@@ -251,6 +283,76 @@ const TODAY_KEY = localDayKey(today);
 
   const s3 = await call("/token-stats/summary");
   check("C6 汇总含全部会话（6 次请求）", s3.body.total.requests === 6, `requests=${s3.body.total.requests}`);
+
+  rmSync(tmp, { recursive: true, force: true });
+}
+
+// ── 测试 D：settings 配置表单注册 + storagePath/keepDays 实时切换 ───────────
+{
+  const tmp = mkdtempSync(join(tmpdir(), "token-stats-testD-"));
+  process.env.DSH_HOME = tmp;
+  const pathA = join(tmp, "storages", "a.json");
+  const pathB = join(tmp, "storages", "b.json");
+
+  // 一份今天的日志：top1 会话 2 次请求
+  const sess = join(tmp, "sessions", "p", "session-top1");
+  mkdirSync(sess, { recursive: true });
+  writeFileSync(join(sess, "session.jsonl"),
+    JSON.stringify({ type: "session", id: "top1", createdAt: today, delegationDepth: 0 }) + "\n" +
+    JSON.stringify(usageEv("opencode-go", "deepseek-v4-flash", { inputTokens: 1000, outputTokens: 500 }, today)) + "\n" +
+    JSON.stringify(usageEv("opencode-go", "deepseek-v4-flash", { inputTokens: 2000, outputTokens: 800, cacheReadTokens: 3000 }, today)) + "\n");
+
+  const { ctx, routes, commands, settingsScopes, emit } = makeCtx();
+  plugin.apply(ctx, { storagePath: pathA });
+  await new Promise((r) => setTimeout(r, 200));
+
+  check("D1 注册 settings 区块（命名空间 token-stats）",
+    settingsScopes.length === 1 && settingsScopes[0].ns === "token-stats",
+    JSON.stringify(settingsScopes.map((s) => s.ns)));
+
+  const call = async (url) => {
+    const route = routes[0];
+    const req = { url };
+    let status = 0, body = "";
+    const res = { writeHead: (s) => { status = s; }, end: (b) => { body = b; } };
+    await route.handler(req, res);
+    return { status, body: JSON.parse(body) };
+  };
+
+  // 初始：a.json 已由启动重建写入
+  check("D2 初始 a.json 存在且 2 次请求",
+    existsSync(pathA) && JSON.parse(readFileSync(pathA, "utf8")).days[TODAY_KEY] &&
+      Object.values(JSON.parse(readFileSync(pathA, "utf8")).days[TODAY_KEY]).flatMap((p) => Object.values(p))[0].requests === 2);
+
+  // GUI 修改配置：storagePath → b.json, keepDays → 30（触发 watch）
+  const scope = settingsScopes[0];
+  scope.value = { storagePath: pathB, keepDays: 30 };
+  scope.watchFn();
+  await new Promise((r) => setTimeout(r, 2600));
+
+  check("D3 切换后 b.json 生成且含日志重建数据（2 次请求）",
+    existsSync(pathB) && (() => {
+      const st = JSON.parse(readFileSync(pathB, "utf8"));
+      const day = st.days[TODAY_KEY];
+      if (!day) return false;
+      const m = Object.values(day).flatMap((p) => Object.values(p))[0];
+      return m.requests === 2 && m.inputTokens === 3000 && m.cacheReadTokens === 3000;
+    })());
+  check("D4 旧文件 a.json 保留", existsSync(pathA));
+
+  // 切换后实时事件写入新文件
+  emit({ id: "live-top", header: { delegationDepth: 0 } },
+    usageEv("opencode-go", "deepseek-v4-flash", { inputTokens: 100, outputTokens: 50 }, today));
+  await new Promise((r) => setTimeout(r, 2600));
+  const after = JSON.parse(readFileSync(pathB, "utf8"));
+  const mAfter = Object.values(after.days[TODAY_KEY]).flatMap((p) => Object.values(p))[0];
+  check("D5 切换后实时续计写入 b.json（3 次请求）", mAfter.requests === 3, JSON.stringify(mAfter));
+
+  // keepDays 变更不炸、接口仍可用
+  scope.value = { storagePath: pathB, keepDays: 60 };
+  scope.watchFn();
+  const s = await call("/token-stats/summary");
+  check("D6 keepDays 变更后接口正常", s.status === 200 && s.body.total.requests === 3);
 
   rmSync(tmp, { recursive: true, force: true });
 }

@@ -88,10 +88,13 @@ const storagePath = join(tmp, "token-stats.json");
 const handlers = {};
 const ctx = {
   on: (name, fn) => { (handlers[name] ??= []).push(fn); },
-  inject: (services, cb) => cb({
-    webServer: { register: () => () => {} },
-    commands: { register: () => () => {} }
-  }),
+  inject: (services, cb) => {
+    if (services.includes("settings")) return; // 无 settings 服务：配置表单不注册
+    cb({
+      webServer: { register: () => () => {} },
+      commands: { register: () => () => {} }
+    });
+  },
   logger: { info: (...a) => console.log(...a), warn: (...a) => console.log(...a) }
 };
 
@@ -117,10 +120,13 @@ console.log(totals.requests === truth.requests ? "✓ 与日志一致" : "✗ �
 const handlers2 = {};
 const ctx2 = {
   on: (name, fn) => { (handlers2[name] ??= []).push(fn); },
-  inject: (services, cb) => cb({
-    webServer: { register: () => () => {} },
-    commands: { register: () => () => {} }
-  }),
+  inject: (services, cb) => {
+    if (services.includes("settings")) return; // 无 settings 服务：配置表单不注册
+    cb({
+      webServer: { register: () => () => {} },
+      commands: { register: () => () => {} }
+    });
+  },
   logger: { info: () => {}, warn: (...a) => console.log(...a) }
 };
 plugin.apply(ctx2, { storagePath });
