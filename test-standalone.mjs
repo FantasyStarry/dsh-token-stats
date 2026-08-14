@@ -42,7 +42,11 @@ const makeCtx = () => {
       logger: { info: (...a) => console.log("[ctx:info]", ...a), warn: (...a) => console.log("[ctx:warn]", ...a) }
     },
     handlers,
-    emit: (ev) => handlers["session/event"].forEach((fn) => fn({ id: "s" }, ev))
+    emit: (sessionOrEv, ev) => {
+      const session = ev === undefined ? { id: "s" } : sessionOrEv;
+      const event = ev === undefined ? sessionOrEv : ev;
+      handlers["session/event"].forEach((fn) => fn(session, event));
+    }
   };
 };
 
@@ -109,6 +113,10 @@ const TODAY_KEY = localDayKey(today);
   check("A5 404 HTTP", nf.status === 404);
   const cmd = commands[0].handler();
   check("A6 /usage 命令", commands[0].name === "usage" && cmd.kind === "success" && cmd.text.includes("共 3 次请求"));
+  const ss = await call("/token-stats/sessions");
+  check("A7 sessions HTTP（实时会话 s 记为顶层）",
+    ss.status === 200 && ss.body.sessions.length === 1 && ss.body.sessions[0].id === "s" && ss.body.sessions[0].subagent === false,
+    JSON.stringify(ss.body));
 
   rmSync(tmp, { recursive: true, force: true });
 }
@@ -161,6 +169,88 @@ const TODAY_KEY = localDayKey(today);
   const st3 = JSON.parse(readFileSync(storagePath, "utf8"));
   const d3 = Object.values(st3.days[Object.keys(st3.days).pop()]).flatMap((p) => Object.values(p))[0];
   check("B3 重启后重建不重复计数（3 次请求）", d3.requests === 3, JSON.stringify(d3));
+
+  rmSync(tmp, { recursive: true, force: true });
+}
+
+// ── 测试 C：子代理会话分类（日志头 + 实时 header）+ sessions 接口 ───────────
+{
+  const tmp = mkdtempSync(join(tmpdir(), "token-stats-testC-"));
+  const storagePath = join(tmp, "storages", "token-stats.json");
+  process.env.DSH_HOME = tmp;
+
+  // 顶层会话 top1：头无 parentSession / origin
+  const topDir = join(tmp, "sessions", "p", "session-top1");
+  mkdirSync(topDir, { recursive: true });
+  writeFileSync(join(topDir, "session.jsonl"),
+    JSON.stringify({ type: "session", id: "top1", createdAt: today, delegationDepth: 0 }) + "\n" +
+    JSON.stringify(usageEv("opencode-go", "deepseek-v4-flash", { inputTokens: 1000, outputTokens: 500 }, today)) + "\n");
+
+  // 子代理会话 sub1：头带 parentSession + origin: subagent + delegationDepth: 1
+  const subDir = join(tmp, "sessions", "p", "session-sub1");
+  mkdirSync(subDir, { recursive: true });
+  writeFileSync(join(subDir, "session.jsonl"),
+    JSON.stringify({ type: "session", id: "sub1", createdAt: today, parentSession: "top1", origin: "subagent", delegationDepth: 1 }) + "\n" +
+    JSON.stringify(usageEv("opencode-go", "deepseek-v4-flash", { inputTokens: 4000, outputTokens: 2000, cacheReadTokens: 10000 }, today)) + "\n");
+
+  // 子代理判定退路：只有 parentSession（老日志无 origin 字段）
+  const sub2Dir = join(tmp, "sessions", "p", "session-sub2");
+  mkdirSync(sub2Dir, { recursive: true });
+  writeFileSync(join(sub2Dir, "session.jsonl"),
+    JSON.stringify({ type: "session", id: "sub2", createdAt: today, parentSession: "top1", delegationDepth: 1 }) + "\n" +
+    JSON.stringify(usageEv("opencode-go", "deepseek-v4-flash", { inputTokens: 500, outputTokens: 100 }, today)) + "\n");
+
+  const { ctx, routes, commands, emit } = makeCtx();
+  plugin.apply(ctx, { storagePath });
+
+  const call = async (url) => {
+    const route = routes[0];
+    const req = { url };
+    let status = 0, body = "";
+    const res = { writeHead: (s) => { status = s; }, end: (b) => { body = b; } };
+    await route.handler(req, res);
+    return { status, body: JSON.parse(body) };
+  };
+
+  const s1 = await call("/token-stats/sessions");
+  const byId = Object.fromEntries(s1.body.sessions.map((x) => [x.id, x]));
+  check("C1 重建分类：top1 顶层 / sub1、sub2 子代理（含 parent 字段）",
+    s1.status === 200 &&
+      byId.top1 && byId.top1.subagent === false &&
+      byId.sub1 && byId.sub1.subagent === true && byId.sub1.parent === "top1" &&
+      byId.sub2 && byId.sub2.subagent === true && byId.sub2.parent === "top1",
+    JSON.stringify(s1.body.sessions));
+
+  const totals = s1.body.sessions.reduce((a, x) => ({
+    req: a.req + x.requests,
+    billed: a.billed + x.inputTokens + x.cacheReadTokens + x.cacheWriteTokens
+  }), { req: 0, billed: 0 });
+  check("C2 sessions 合计 = 日志真实值（3 会话 / 计费 15500）",
+    totals.req === 3 && totals.billed === 15500, JSON.stringify(totals));
+
+  // 实时：session.header 携带子代理信息 → 计入 subagent 组
+  emit({ id: "live-sub", header: { parentSession: "top1", origin: "subagent", delegationDepth: 1 } },
+    usageEv("opencode-go", "deepseek-v4-flash", { inputTokens: 100, outputTokens: 50 }, today));
+  emit({ id: "live-top", header: { delegationDepth: 0 } },
+    usageEv("opencode-go", "deepseek-v4-flash", { inputTokens: 200, outputTokens: 80 }, today));
+  emit({ id: "no-header" }, usageEv("opencode-go", "deepseek-v4-flash", { inputTokens: 30, outputTokens: 10 }, today));
+  await new Promise((r) => setTimeout(r, 2600));
+
+  const s2 = await call("/token-stats/sessions");
+  const byId2 = Object.fromEntries(s2.body.sessions.map((x) => [x.id, x]));
+  check("C3 实时分类：live-sub 子代理 / live-top、no-header 顶层",
+    byId2["live-sub"].subagent === true && byId2["live-sub"].parent === "top1" &&
+      byId2["live-top"].subagent === false && byId2["no-header"].subagent === false,
+    JSON.stringify(s2.body.sessions));
+
+  // /usage 应包含子代理对账行（sub1/sub2/live-sub 共 3 个子代理会话）
+  const usageText = commands[0].handler().text;
+  check("C5 /usage 含子代理对账行",
+    usageText.includes("其中子代理会话") && usageText.includes("3 个会话"),
+    usageText.split("\n")[1] || "");
+
+  const s3 = await call("/token-stats/summary");
+  check("C6 汇总含全部会话（6 次请求）", s3.body.total.requests === 6, `requests=${s3.body.total.requests}`);
 
   rmSync(tmp, { recursive: true, force: true });
 }
