@@ -112,13 +112,21 @@ dsh plugin --profile web add "file:C:/path/to/dsh-token-stats"
 ## 结构
 
 ```
-lib/index.js    服务端插件（零外部依赖，仅 node 内置模块 + cordis ctx API）
-lib/client.js   客户端插件（AMD bundle，window.__ModuleLoader__ 加载）
-test-standalone.mjs   服务端逻辑独立测试（node test-standalone.mjs）
+src/index.ts    服务端插件源码（TypeScript，strict）
+src/client.ts   客户端插件源码（AMD bundle，window.__ModuleLoader__ 加载）
+lib/index.js    tsc 编译产物（运行/发布用，改 src 后 pnpm build 重新生成）
+lib/client.js   tsc 编译产物
+tsconfig.json   strict 编译配置（ES2022 + ESNext 模块，输出 lib/）
+test-standalone.mjs   服务端逻辑独立测试（pnpm test）
 audit-sessions.mjs    会话日志审计工具：完整解码所有日志并与插件统计对比
 verify-real.mjs       用真实日志验证重建逻辑（storage 指向临时文件，不碰真实数据）
 verify-ui.py    Playwright 端到端验证（python verify-ui.py）
 ```
+
+开发流程：改 `src/*.ts` → `pnpm build`（tsc 生成 `lib/*.js`）→ 把 `lib/` 同步到
+profile 的 `node_modules/dsh-token-stats/lib/` → 刷新浏览器（客户端）/ 重启
+dsh web（服务端）。服务端插件对 `@deepseek-ai/schemastery`、`@deepseek-ai/dsh-settings`
+使用动态 import + 优雅降级（解析不到时仅无配置表单）。
 
 ## 说明
 
