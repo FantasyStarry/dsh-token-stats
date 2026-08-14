@@ -144,6 +144,8 @@ async def main():
         report("角色描边（stroke 样式）", "stroke-opacity: 0.16" in s or "strokeOpacity" in s.replace("stroke-opacity", "strokeOpacity"), "")
         report("底部暗影椭圆", 'key="sh"' in s or "ellipse" in s, "")
         report("空闲情绪（今日大用量 → 晕眩双星）", "ts-pet-star2" in s, "")
+        report("待机活态：身体浮动 + 眼睛左顾右盼", "pt-float" in s and "pt-lookaround" in s, "")
+        report("表情弹入动画类存在", "ts-pet-facepop" in s, "")
         await page.screenshot(path="C:/Users/Mayn/Desktop/dsh-token-stats/ui2-pet-idle.png")
 
         # ── 阶段 2：hover 探头 ──────────────────────────────────────────────
@@ -190,6 +192,7 @@ async def main():
         }]
         report("工作中：小电脑", await wait_svg("ts-pet-laptop"), "")
         report("小电脑进度条动画（ts-pet-prog）", "ts-pet-prog" in await svg_html(), "")
+        report("工作态：屏幕光标闪烁 + 加载点", "pt-cursor" in await svg_html() and "pt-load-dot" in await svg_html(), "")
         report("脉冲点", await wait_class("dts-pulse"), "")
         toast_text = await page.evaluate(
             "() => { const t = document.querySelector('.dts-pop'); return t ? t.innerText : ''; }"
@@ -211,6 +214,12 @@ async def main():
         report("刷新按钮存在", await page.locator("button[aria-label='刷新统计']").count() == 1)
         report("更新时间文本", await page.locator("text=更新于").count() >= 1)
         report("命中率条（dts-hit）", await page.evaluate("() => !!document.querySelector('.dts-hit-track .dts-hit-fill')"))
+        report("提供商汇总 chips", await page.evaluate("() => document.querySelectorAll('.dts-provider-chip').length >= 1"))
+        report("零值日基线圆点（dts-chart-dot）", await page.evaluate("() => !!document.querySelector('.dts-chart-dot')"))
+        report("30 天折叠小节存在", await page.evaluate("() => !!document.querySelector('.dts-section-heading-toggle')"))
+        report("30 天小节可展开（含近 30 天合计）", await page.evaluate(
+            "() => { const t = document.querySelector('.dts-section-heading-toggle'); return t && t.textContent.includes('近 30 天'); }"
+        ))
         report("近 7 天合计（标题注记）", await page.evaluate(
             "() => [...document.querySelectorAll('.dts-section-heading small')].some(s => s.textContent.includes('近 7 天合计'))"
         ))
@@ -239,6 +248,9 @@ async def main():
         ))
         report("移动端指标网格重排（主指标整行）", await page.evaluate(
             "() => { const p = document.querySelector('.dts-primary-metric'); return p && getComputedStyle(p).gridColumn.includes('1 / -1'); }"
+        ))
+        report("移动端表格无横向溢出（scrollWidth ≤ clientWidth）", await page.evaluate(
+            "() => { const m = document.querySelector('.dts-tbl-model'); const s = document.querySelector('.dts-tbl-session'); if (!m || !s) return false; return m.scrollWidth <= m.clientWidth + 2 && s.scrollWidth <= s.clientWidth + 2; }"
         ))
         await page.screenshot(path="C:/Users/Mayn/Desktop/dsh-token-stats/ui2-settings-mobile.png", full_page=True)
 
