@@ -16,12 +16,15 @@
   （`$DSH_HOME/sessions` 下今天有写入的 zstd/jsonl 日志，完整解码全部 zstd 帧），
   再叠加实时订阅的新事件。插件无论何时安装/重启/热重载，今天的数据都以日志为准，
   不漏计、不重复计数。
-- **三处展示**：
-  1. 侧边栏底部常驻小部件：今日输入/输出 token 总计，点击展开按提供商/模型明细
-     （每 30s 轮询 + 窗口聚焦时刷新）；
-  2. 设置页"用量统计"分区：今日明细表（提供商/模型/输入/缓存读/输出/推理/请求数）
-     + 最近 7 天历史；
-  3. `/usage` 命令：在对话中输入 `/usage` 直接查看今日用量（结果渲染为对话流节点）。
+- **三处展示（v0.2.0 起，数字用 k/m/b 缩写）**：
+  1. 侧边栏底部常驻小部件：今日输入/输出 token 总计（如 `今日 72.7M / 425.2k tok`），
+     点击展开按提供商/模型明细（每 30s 轮询 + 窗口聚焦时刷新）；
+  2. 设置页"用量统计"分区（Data-Dense 风格，复用宿主 CSS 变量，深浅色自适应）：
+     - 今日 KPI 卡片：请求次数 / 计费输入 / 输出 / 缓存读（含未缓存输入、命中率）
+     - 指标行：缓存命中率、平均输入/输出每请求
+     - 今日明细表：提供商/模型/计费输入/未缓存/缓存读/输出/推理/请求 + **占比条**
+     - 最近 7 天：纯 CSS 迷你柱状图（输入/输出双柱，hover 看完整数字）+ 历史表；
+  3. `/usage` 命令：对话中输入 `/usage` 直接查看今日用量（缩写，结果渲染为对话流节点）。
 - **HTTP API**（同源，供客户端插件使用）：
   - `GET /token-stats/summary?day=YYYY-MM-DD`（默认今天）
   - `GET /token-stats/history?days=N`（默认 7，上限 30）
@@ -31,13 +34,13 @@
 从 GitHub 安装（推荐，锁定版本标签）：
 
 ```bash
-dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.1.1"
+dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.2.0"
 ```
 
 本地源码安装（开发调试）：
 
 ```bash
-# 1. 安装进 web profile（file: 引用源码目录，改动即时反映）
+# 1. 安装进 web profile（file: 引用源码目录）
 dsh plugin --profile web add "file:C:/path/to/dsh-token-stats"
 
 # 2. 在 $DSH_HOME/profiles/web/cordis.patch.yml 中激活：
@@ -48,8 +51,14 @@ dsh plugin --profile web add "file:C:/path/to/dsh-token-stats"
 # 3. 重启 dsh web（服务端插件代码变更需要重启加载；浏览器刷新页面加载客户端插件）
 ```
 
-升级插件：改代码 → 提交推送 → 打新标签（如 `v0.1.1`）→
-`dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.1.1"` → 重启 `dsh web`。
+> **开发迭代注意**：本机 profile 的 `nodeLinker: hoisted`（pnpm v11）会把 `file:`
+> 依赖**拷贝**进 `node_modules`，并非符号链接。改代码后需要重新
+> `dsh plugin --profile web add "file:..."` 或手动把 `lib/` 同步到
+> `node_modules/dsh-token-stats/lib/`：客户端 bundle（`client.js`）是每次请求实时
+> 读文件的，同步后**刷新浏览器**即生效；服务端（`index.js`）需要**重启 dsh web**。
+
+升级插件：改代码 → 提交推送 → 打新标签（如 `v0.2.0`）→
+`dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.2.0"` → 重启 `dsh web`。
 
 > **注意（v0.1.0 已知问题，v0.1.1 修复）**：DSH 会话日志（`session.jsonl.zstd`）是
 > **多帧 zstd 容器**——每批事件追加一个独立压缩帧。v0.1.0 的回填用

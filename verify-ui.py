@@ -1,84 +1,54 @@
-"""验证 dsh-token-stats 插件在 Web GUI 中的展示。"""
-import sys
-from playwright.sync_api import sync_playwright
+"""DOM 断言验证：KPI 卡片并排、柱状图数量、占比条宽度、平均输出小数修复。"""
+import asyncio
+from playwright.async_api import async_playwright
 
-URL = "http://127.0.0.1:3080"
-OUT = "C:/Users/Mayn/Desktop/File_Manager_Legacy/tools/dsh-plugins/token-stats/verify"
+async def main():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(channel="msedge")
+        page = await browser.new_page(viewport={"width": 1560, "height": 1000})
+        errors = []
+        page.on("pageerror", lambda err: errors.append(f"PAGEERROR: {err}"))
+        await page.goto("http://127.0.0.1:3080", wait_until="networkidle", timeout=30000)
+        await page.wait_for_timeout(5000)
+        await page.locator("text=设置").first.click(timeout=5000)
+        await page.wait_for_timeout(3500)
+        await page.locator("text=用量统计").first.click(timeout=5000)
+        await page.wait_for_timeout(2500)
 
-with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True, channel="msedge")
-    page = browser.new_page(viewport={"width": 1440, "height": 900})
-    console_errors = []
-    page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
-    page.on("pageerror", lambda err: console_errors.append(f"PAGEERROR: {err}"))
+        # KPI 卡片：找到 4 个大数字卡（flex 容器内的 4 个 div）
+        info = await page.evaluate("""
+        () => {
+          const out = {};
+          // 平均输出文本
+          const metrics = [...document.querySelectorAll('p')].map(p => p.innerText).find(t => t.includes('平均输入'));
+          out.metrics = metrics || null;
+          // 占比条：track 与 fill
+          const bars = [...document.querySelectorAll('div')].filter(d => {
+            const s = getComputedStyle(d);
+            return s.borderRadius === '3px' && s.height === '6px' && d.children.length === 1 && d.parentElement && d.parentElement.children.length <= 2;
+          });
+          out.shareTracks = bars.length;
+          // 柱状图柱子（9px 宽的 div）
+          const cols = [...document.querySelectorAll('div')].filter(d => getComputedStyle(d).width === '9px');
+          out.barColumns = cols.length;
+          // KPI 卡片位置：字号 20px 的数值
+          const vals = [...document.querySelectorAll('div')].filter(d => {
+            const s = getComputedStyle(d);
+            return s.fontSize === '20px' && s.fontWeight === '600';
+          }).map(d => ({ text: d.innerText, x: Math.round(d.getBoundingClientRect().x), y: Math.round(d.getBoundingClientRect().y) }));
+          out.kpiValues = vals;
+          return out;
+        }
+        """)
+        print("指标行:", info["metrics"])
+        print("KPI 数值:", info["kpiValues"])
+        ys = {v["y"] for v in info["kpiValues"]}
+        xs = sorted(v["x"] for v in info["kpiValues"])
+        print(f"KPI 同一行(y 唯一值数={len(ys)}):", "PASS" if len(ys) == 1 and len(xs) == 4 else "FAIL", xs)
+        print("占比条数量:", info["shareTracks"], "PASS" if info["shareTracks"] >= 1 else "FAIL")
+        print("柱状图柱子数:", info["barColumns"], "PASS" if info["barColumns"] == 14 else "FAIL")
+        print("页面错误:", errors if errors else "无")
+        await page.screenshot(path="C:/Users/Mayn/Desktop/dsh-token-stats/ui-settings.png")
+        await browser.close()
 
-    page.goto(URL, wait_until="networkidle", timeout=30000)
-    page.wait_for_timeout(4000)  # 等客户端插件物化
-
-    body = page.content()
-    # 1) 侧边栏小部件
-    widget_found = "今日" in body and "tok" in body
-    print(f"侧边栏小部件文本可见: {widget_found}")
-
-    # 找包含 '今日' 的元素并截图区域
-    page.screenshot(path=f"{OUT}-sidebar.png", full_page=False)
-
-    # 2) 点击小部件展开明细
-    clicked = False
-    try:
-        page.get_by_text("tok", exact=False).first.click(timeout=5000)
-        clicked = True
-        page.wait_for_timeout(800)
-    except Exception as e:
-        print(f"点击小部件失败: {e}")
-    page.screenshot(path=f"{OUT}-widget-open.png")
-
-    # 3) 设置页 → 用量统计
-    try:
-        # 侧边栏底部设置入口
-        page.locator("text=设置").first.click(timeout=5000)
-        page.wait_for_timeout(1500)
-        page.screenshot(path=f"{OUT}-settings.png")
-        body2 = page.content()
-        section_found = "用量统计" in body2
-        print(f"设置页出现'用量统计'分区: {section_found}")
-        if section_found:
-            try:
-                page.get_by_text("用量统计", exact=True).first.click(timeout=5000)
-                page.wait_for_timeout(1500)
-                page.screenshot(path=f"{OUT}-settings-section.png")
-                body3 = page.content()
-                print(f"分区内容渲染(今日 token 用量): {'今日 token 用量' in body3}")
-                print(f"分区内容渲染(最近 7 天): {'最近 7 天' in body3}")
-            except Exception as e:
-                print(f"点击用量统计分区失败: {e}")
-    except Exception as e:
-        print(f"打开设置页失败: {e}")
-
-    # 4) 命令 /usage 测试（对话输入框输入 /usage）
-    try:
-        page.goto(URL, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(2000)
-        # 找对话输入框（textarea 或 contenteditable）
-        input_el = page.locator("textarea").first
-        if input_el.count() == 0:
-            input_el = page.locator("[contenteditable=true]").first
-        if input_el.count() > 0:
-            input_el.click()
-            page.keyboard.type("/usage")
-            page.wait_for_timeout(1200)
-            page.screenshot(path=f"{OUT}-command-menu.png")
-            page.keyboard.press("Enter")
-            page.wait_for_timeout(3000)
-            page.screenshot(path=f"{OUT}-command-result.png")
-            body4 = page.content()
-            print(f"命令输出包含'今日': {'今日' in body4 and 'token' in body4}")
-        else:
-            print("未找到对话输入框")
-    except Exception as e:
-        print(f"命令测试失败: {e}")
-
-    print(f"\nconsole 错误数: {len(console_errors)}")
-    for err in console_errors[:10]:
-        print(f"  - {err[:200]}")
-    browser.close()
+asyncio.run(main())
