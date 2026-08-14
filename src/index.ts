@@ -124,6 +124,15 @@ interface SessionLike {
   header?: { parentSession?: string; origin?: string; delegationDepth?: number };
 }
 
+/** 一次完成的模型调用（实时活动推送，仅内存保留约 60s）。 */
+interface CompletionEvent {
+  at: number;
+  sessionId: string;
+  subagent: boolean;
+  billedInput: number;
+  outputTokens: number;
+}
+
 /** cordis 上下文（仅本项目用到的面）。 */
 interface CordisLike {
   on(event: string, listener: (...args: any[]) => void): void;
@@ -453,6 +462,10 @@ export default {
     let dirty = false;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let lastFlushAt = 0;
+    /** 上次实时活动的时刻（仅实时订阅更新，重建不触发），0 = 尚无活动。 */
+    let lastActivityAt = 0;
+    /** 最近完成的模型调用（内存环形缓冲，约 60s / 20 条）。 */
+    const recentCompletions: CompletionEvent[] = [];
 
     const flush = () => {
       if (!dirty) return;
@@ -546,8 +559,23 @@ export default {
 
     // ── 实时订阅：每个会话的每一条事件（firehose，不重放历史） ─────────────
     ctx.on("session/event", (session: SessionLike, event: LogEvent) => {
-      if (!event || event.type !== "assistant/message") return;
+      if (!event || typeof event.type !== "string") return;
       const data = event.data;
+      // 任何代理活动都刷新"上次活动时刻"（turn/start、tool/call、chunk 等），
+      // 让"工作中"反映真实的进行中状态，而不是只等一次完整调用结束（v0.7.0）。
+      if (
+        event.type === "assistant/message" ||
+        event.type === "turn/start" ||
+        event.type === "turn/end" ||
+        event.type === "step/start" ||
+        event.type === "step/end" ||
+        event.type === "tool/call" ||
+        event.type === "tool/result" ||
+        event.type === "assistant/chunk"
+      ) {
+        lastActivityAt = Date.now();
+      }
+      if (event.type !== "assistant/message") return;
       if (!data || !data.usage || typeof data.usage !== "object") return;
       const source = data.message && data.message.source;
       const header = session && typeof session === "object" ? session.header : undefined;
@@ -569,6 +597,18 @@ export default {
         event.time || Date.now(),
         meta
       );
+      // 实时活动：记录"上次活动时刻"与本次完成信息（供前端做工作/休息/完成提示）
+      const now = Date.now();
+      recentCompletions.push({
+        at: now,
+        sessionId: meta && meta.id ? meta.id : "",
+        subagent: !!(meta && meta.subagent),
+        billedInput: (data.usage.inputTokens ?? 0) + (data.usage.cacheReadTokens ?? 0) + (data.usage.cacheWriteTokens ?? 0),
+        outputTokens: data.usage.outputTokens ?? 0
+      });
+      if (recentCompletions.length > 20) recentCompletions.shift();
+      const cutoff = now - 60000;
+      while (recentCompletions.length > 0 && recentCompletions[0].at < cutoff) recentCompletions.shift();
     });
 
     // ── 设置页"插件配置"表单（storagePath / keepDays，GUI 修改实时生效） ────
@@ -626,7 +666,10 @@ export default {
       const path = url.pathname;
       if (path === "/token-stats/summary") {
         const day = url.searchParams.get("day") || dateKeyOf(Date.now());
-        writeJson(res, 200, summaryFor(state, day));
+        writeJson(res, 200, {
+          ...summaryFor(state, day),
+          activity: { lastAt: lastActivityAt, completions: recentCompletions }
+        });
       } else if (path === "/token-stats/history") {
         const parsed = Number(url.searchParams.get("days"));
         const days = Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 30) : 7;
