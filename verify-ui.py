@@ -37,6 +37,14 @@ async def main():
             return s.fontSize === '20px' && s.fontWeight === '600';
           }).map(d => ({ text: d.innerText, x: Math.round(d.getBoundingClientRect().x), y: Math.round(d.getBoundingClientRect().y) }));
           out.kpiValues = vals;
+          // 对账面板：含"对账："文本的块
+          const rec = [...document.querySelectorAll('div')].find(d => d.innerText && d.innerText.startsWith('对账：'));
+          out.reconcile = rec ? rec.innerText : null;
+          // 按会话分组表头
+          out.sessionHeads = [...document.querySelectorAll('div')].filter(d => {
+            const t = d.innerText || '';
+            return t.startsWith('顶层会话（') || t.startsWith('子代理会话（');
+          }).map(d => d.innerText);
           return out;
         }
         """)
@@ -47,6 +55,8 @@ async def main():
         print(f"KPI 同一行(y 唯一值数={len(ys)}):", "PASS" if len(ys) == 1 and len(xs) == 4 else "FAIL", xs)
         print("占比条数量:", info["shareTracks"], "PASS" if info["shareTracks"] >= 1 else "FAIL")
         print("柱状图柱子数:", info["barColumns"], "PASS" if info["barColumns"] == 14 else "FAIL")
+        print("对账面板:", info["reconcile"], "PASS" if info["reconcile"] and "子代理" in info["reconcile"] else "FAIL")
+        print("会话分组:", info["sessionHeads"], "PASS" if any("顶层会话" in h for h in info["sessionHeads"]) and any("子代理会话" in h for h in info["sessionHeads"]) else "FAIL")
         print("页面错误:", errors if errors else "无")
         await page.screenshot(path="C:/Users/Mayn/Desktop/dsh-token-stats/ui-settings.png")
         await browser.close()
