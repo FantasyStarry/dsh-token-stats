@@ -1,0 +1,41 @@
+{
+  "name": "dsh-token-stats",
+  "version": "0.1.0",
+  "description": "按自然日统计 LLM token 用量（按提供商/模型）：侧边栏常驻小部件 + 设置页\"用量统计\"分区 + /usage 命令",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "token",
+    "usage",
+    "stats"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FantasyStarry/dsh-token-stats.git"
+  }
+}
