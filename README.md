@@ -12,8 +12,10 @@
     `cacheWriteTokens`（缓存写）、`reasoningTokens`（推理）
   - 计费输入 ≈ `inputTokens + cacheReadTokens + cacheWriteTokens`
 - **按自然日**（服务器本地时区 `YYYY-MM-DD`）聚合，历史保留 366 天（可配）。
-- **启动回填**：自动扫描 `$DSH_HOME/sessions` 下今天有写入的会话日志
-  （zstd/jsonl），把今天早些时候的用量也统计进来。
+- **启动重建（v0.1.1）**：每次加载插件时把"今天"的统计从会话日志整体重算
+  （`$DSH_HOME/sessions` 下今天有写入的 zstd/jsonl 日志，完整解码全部 zstd 帧），
+  再叠加实时订阅的新事件。插件无论何时安装/重启/热重载，今天的数据都以日志为准，
+  不漏计、不重复计数。
 - **三处展示**：
   1. 侧边栏底部常驻小部件：今日输入/输出 token 总计，点击展开按提供商/模型明细
      （每 30s 轮询 + 窗口聚焦时刷新）；
@@ -29,7 +31,7 @@
 从 GitHub 安装（推荐，锁定版本标签）：
 
 ```bash
-dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.1.0"
+dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.1.1"
 ```
 
 本地源码安装（开发调试）：
@@ -43,11 +45,17 @@ dsh plugin --profile web add "file:C:/path/to/dsh-token-stats"
 #     - id: token-stats
 #       name: dsh-token-stats
 
-# 3. 重启 dsh web（或依赖 cordis.patch.yml 热重载；浏览器刷新页面加载客户端插件）
+# 3. 重启 dsh web（服务端插件代码变更需要重启加载；浏览器刷新页面加载客户端插件）
 ```
 
 升级插件：改代码 → 提交推送 → 打新标签（如 `v0.1.1`）→
 `dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.1.1"` → 重启 `dsh web`。
+
+> **注意（v0.1.0 已知问题，v0.1.1 修复）**：DSH 会话日志（`session.jsonl.zstd`）是
+> **多帧 zstd 容器**——每批事件追加一个独立压缩帧。v0.1.0 的回填用
+> `zstdDecompressSync` 解整个文件只能得到第一帧（通常是 session 头），导致启动回填
+> 实际读到 0 条 usage：插件加载之前发生的调用全部漏计（实测漏掉约 3/4 的用量）。
+> v0.1.1 改为按帧完整解码 + 每次加载重建今天，数据与日志完全一致。
 
 ## 配置
 
@@ -87,6 +95,8 @@ dsh plugin --profile web add "file:C:/path/to/dsh-token-stats"
 lib/index.js    服务端插件（零外部依赖，仅 node 内置模块 + cordis ctx API）
 lib/client.js   客户端插件（AMD bundle，window.__ModuleLoader__ 加载）
 test-standalone.mjs   服务端逻辑独立测试（node test-standalone.mjs）
+audit-sessions.mjs    会话日志审计工具：完整解码所有日志并与插件统计对比
+verify-real.mjs       用真实日志验证重建逻辑（storage 指向临时文件，不碰真实数据）
 verify-ui.py    Playwright 端到端验证（python verify-ui.py）
 ```
 
@@ -94,5 +104,7 @@ verify-ui.py    Playwright 端到端验证（python verify-ui.py）
 
 - 数据源可靠性：`assistant/message` 事件在适配器上报时携带 `usage`
   （DeepSeek 官方适配器与 pi-ai 适配器均上报）。未上报的调用不会计入。
+- 重建只覆盖当前自然日；更早的天依赖插件当时在运行（实时计数），
+  插件没在运行期间发生的调用不会补计。
 - 客户端插件无需重新构建 web 前端：宿主扫描带 `dsh.client` 字段的包并通过
   `/plugins/<id>/client.js` 运行时提供。
