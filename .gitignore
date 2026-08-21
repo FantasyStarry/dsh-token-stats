@@ -2,3 +2,4 @@ node_modules/
 *.log
 verify-*.png
 ui-*.png
+intro-*.png

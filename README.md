@@ -3,6 +3,8 @@
 按自然日统计 DeepSeek Harness（DSH）Web 的 LLM token 用量，按**提供商 / 模型**拆分，
 持久化到磁盘，并在 Web GUI 的多个位置展示。
 
+> **项目介绍页**：[docs/index.html](docs/index.html)（单文件 HTML，浏览器直接打开，含安装指引）
+
 ## 功能
 
 - **统计口径**：每次成功的模型调用计一次（来自会话事件 `assistant/message` 的

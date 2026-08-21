@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dsh-token-stats · DeepSeek Harness 的 token 账本</title>
+<meta name="description" content="按自然日统计 DeepSeek Harness 的 LLM token 用量与估算费用，悬浮史莱姆宠物、设置页用量统计、活跃热力图、官方余额查询，一个插件全搞定。">
+<style>
+  /* ── 设计令牌：浅色单主题 · DeepSeek 品牌蓝单强调色 ── */
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --ink: #16191f;
+    --ink-2: #454d59;
+    --ink-3: #6b7380;
+    --border: #e3e7ec;
+    --border-2: #d4dae2;
+    --accent: #3b5bdb;
+    --accent-soft: #eef1fd;
+    --accent-ink: #ffffff;
+    --ok: #1f9d55;
+    --code-bg: #14181f;
+    --code-ink: #dbe3ee;
+    --radius-card: 16px;
+    --radius-code: 12px;
+    --font: -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  /* ── 导航：单行 · 高 64px ── */
+  .nav {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(246, 247, 249, .88);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-inner { display: flex; align-items: center; gap: 12px; height: 64px; }
+  .brand { display: inline-flex; align-items: center; gap: 9px; color: var(--ink); font-weight: 700; font-size: 15.5px; }
+  .brand:hover { text-decoration: none; }
+  .brand svg { display: block; }
+  .nav-links { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .nav-links a { color: var(--ink-2); font-size: 13.5px; padding: 7px 12px; border-radius: 999px; }
+  .nav-links a:hover { background: var(--accent-soft); color: var(--accent); text-decoration: none; }
+
+  /* ── 按钮：全胶囊 · 主/次两级 ── */
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    border-radius: 999px; padding: 11px 22px; font-size: 14.5px; font-weight: 600;
+    cursor: pointer; border: 1px solid transparent; transition: transform .16s ease, box-shadow .16s ease, background .16s ease;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn-primary { background: var(--accent); color: var(--accent-ink); box-shadow: 0 6px 18px rgba(59, 91, 219, .28); }
+  .btn-primary:hover { background: #3150c9; text-decoration: none; box-shadow: 0 8px 22px rgba(59, 91, 219, .34); }
+  .btn-primary.ok { background: var(--ok); box-shadow: 0 6px 18px rgba(31, 157, 85, .28); }
+  .btn-ghost { background: transparent; color: var(--ink-2); border-color: var(--border-2); }
+  .btn-ghost:hover { background: var(--surface); color: var(--ink); text-decoration: none; }
+
+  /* ── Hero：左文右宠（非对称） · 顶距 ≤ 96px ── */
+  .hero { padding: 88px 0 72px; }
+  .hero-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr); gap: 48px; align-items: center; }
+  .hero h1 { margin: 0 0 18px; font-size: clamp(34px, 4.6vw, 54px); line-height: 1.14; letter-spacing: -0.02em; font-weight: 800; }
+  .hero h1 em { font-style: normal; color: var(--accent); }
+  .hero p { margin: 0 0 30px; max-width: 46ch; color: var(--ink-2); font-size: 16.5px; }
+  .hero-cta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .hero-meta { margin-top: 26px; display: flex; flex-wrap: wrap; gap: 8px 18px; color: var(--ink-3); font-size: 12.5px; }
+  .hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
+
+  /* 宠物舞台 */
+  .stage { position: relative; display: flex; align-items: center; justify-content: center; min-height: 380px; }
+  .stage-glow {
+    position: absolute; width: 340px; height: 340px; border-radius: 50%;
+    background: radial-gradient(circle, rgba(59, 91, 219, .12), rgba(59, 91, 219, 0) 68%);
+  }
+  .slime { position: relative; z-index: 2; animation: slime-breathe 3.6s ease-in-out infinite; filter: drop-shadow(0 18px 24px rgba(22, 25, 31, .16)); }
+  .stage-shadow { position: absolute; bottom: 26px; left: 50%; transform: translateX(-50%); width: 120px; height: 16px; border-radius: 50%; background: radial-gradient(ellipse, rgba(22, 25, 31, .18), rgba(22, 25, 31, 0) 70%); }
+  .chip {
+    position: absolute; z-index: 3; display: flex; flex-direction: column; gap: 2px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 9px 14px; box-shadow: 0 10px 26px rgba(22, 25, 31, .08);
+    font-size: 11px; color: var(--ink-3); white-space: nowrap;
+  }
+  .chip strong { font-family: var(--mono); font-size: 15px; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .chip-a { top: 8%; left: 2%; animation: float-a 5.2s ease-in-out infinite; }
+  .chip-b { top: 30%; right: 0; animation: float-b 6s ease-in-out infinite; }
+  .chip-c { bottom: 14%; left: 6%; animation: float-a 6.6s ease-in-out infinite; }
+  @keyframes slime-breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.035, .975); } }
+  @keyframes float-a { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-7px); } }
+  @keyframes float-b { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(6px); } }
+
+  /* ── 章节标题：垂直堆叠（非 split-header） ── */
+  .section { padding: 64px 0; }
+  .section-head { max-width: 620px; margin-bottom: 34px; }
+  .eyebrow { font-size: 11.5px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); margin: 0 0 10px; }
+  .section h2 { margin: 0 0 12px; font-size: clamp(24px, 3vw, 32px); letter-spacing: -0.015em; font-weight: 800; line-height: 1.25; }
+  .section .sub { margin: 0; color: var(--ink-2); font-size: 15px; }
+
+  /* ── Bento 功能网格：6 格 · 有节奏（7+5 / 4+4+4 / 12） ── */
+  .bento { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+  .cell {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-card);
+    padding: 22px; display: flex; flex-direction: column; gap: 12px; min-width: 0;
+    transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+  }
+  .cell:hover { border-color: var(--border-2); box-shadow: 0 14px 34px rgba(22, 25, 31, .07); transform: translateY(-2px); }
+  .cell h3 { margin: 0; font-size: 16px; font-weight: 700; }
+  .cell p { margin: 0; color: var(--ink-2); font-size: 13.5px; }
+  .cell-tag { font-size: 11px; color: var(--ink-3); }
+  .span-7 { grid-column: span 7; } .span-5 { grid-column: span 5; }
+  .span-4 { grid-column: span 4; } .span-12 { grid-column: span 12; }
+  .cell-body { margin-top: auto; }
+
+  /* 宠物格：情绪行 */
+  .mood-row { display: flex; align-items: flex-end; gap: 14px; }
+  .mood-list { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--ink-2); }
+  .mood-list span { display: flex; align-items: center; gap: 7px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .dot.working { background: var(--accent); } .dot.idle { background: #8aa0c8; }
+  .dot.busy { background: #e8a13c; } .dot.dizzy { background: #c86b6b; } .dot.sleepy { background: #9aa3b2; }
+
+  /* 费用格：数字 + sparkline */
+  .fee-big { font-family: var(--mono); font-size: 30px; font-weight: 700; letter-spacing: -0.02em; }
+  .fee-big small { font-size: 13px; font-weight: 500; color: var(--ink-3); margin-left: 6px; }
+  .fee-note { font-size: 11.5px; color: var(--ink-3); }
+
+  /* 余额格 */
+  .balance-pill { display: inline-flex; align-items: baseline; gap: 8px; padding: 10px 16px; border: 1px solid var(--border-2); border-radius: 999px; background: var(--bg); }
+  .balance-pill strong { font-family: var(--mono); font-size: 20px; }
+  .balance-pill span { font-size: 11.5px; color: var(--ink-3); }
+
+  /* 热力图格 */
+  .heat { display: grid; grid-template-columns: repeat(14, 1fr); gap: 4px; }
+  .heat i { aspect-ratio: 1; border-radius: 3px; background: #e8ecf3; }
+  .heat i.l1 { background: #c9d4f8; } .heat i.l2 { background: #93aaf2; }
+  .heat i.l3 { background: #5e7be6; } .heat i.l4 { background: var(--accent); }
+  .heat-legend { display: flex; gap: 10px; font-size: 10.5px; color: var(--ink-3); align-items: center; margin-top: 4px; }
+  .heat-legend i { width: 9px; height: 9px; border-radius: 2px; }
+
+  /* 命令格 */
+  .mini-term { background: var(--code-bg); color: var(--code-ink); border-radius: 10px; padding: 12px 14px; font-family: var(--mono); font-size: 12px; line-height: 1.8; }
+  .mini-term .p { color: #6f86b8; } .mini-term .hl { color: #9db8f5; }
+
+  /* 导出格：chip 流 */
+  .chip-flow { display: flex; flex-wrap: wrap; gap: 8px; }
+  .mini-chip { font-size: 11.5px; padding: 5px 12px; border-radius: 999px; border: 1px solid var(--border-2); color: var(--ink-2); background: var(--bg); }
+
+  /* ── 截图：非对称画廊（真实截图，说明在下方） ── */
+  .gallery { display: grid; grid-template-columns: 1fr 1.35fr; gap: 20px; align-items: start; }
+  .shot { margin: 0; }
+  .shot img { width: 100%; display: block; border-radius: var(--radius-card); border: 1px solid var(--border); box-shadow: 0 16px 40px rgba(22, 25, 31, .08); }
+  .shot figcaption { margin-top: 10px; font-size: 12.5px; color: var(--ink-3); }
+  .shot.tall { grid-row: span 2; }
+
+  /* ── 费用口径：左文右表 ── */
+  .fee-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 40px; align-items: start; }
+  .points { display: flex; flex-direction: column; gap: 18px; margin: 0; padding: 0; list-style: none; }
+  .points li { display: flex; gap: 12px; }
+  .points .n { flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; margin-top: 2px; }
+  .points b { display: block; font-size: 14.5px; margin-bottom: 3px; }
+  .points p { margin: 0; font-size: 13.5px; color: var(--ink-2); }
+  .price-table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-card); overflow: hidden; }
+  .price-table th { text-align: left; font-size: 11.5px; color: var(--ink-3); font-weight: 600; padding: 12px 16px; border-bottom: 1px solid var(--border); letter-spacing: .04em; }
+  .price-table td { padding: 11px 16px; border-bottom: 1px solid var(--border); color: var(--ink-2); }
+  .price-table tr:last-child td { border-bottom: none; }
+  .price-table td:first-child { font-family: var(--mono); color: var(--ink); font-weight: 600; font-size: 12.5px; }
+  .price-table td.num { text-align: right; font-family: var(--mono); color: var(--ink); }
+
+  /* ── 安装：终端面板 ── */
+  .install-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr); gap: 32px; align-items: start; }
+  .term { background: var(--code-bg); border-radius: var(--radius-code); overflow: hidden; box-shadow: 0 18px 44px rgba(22, 25, 31, .22); }
+  .term-head { display: flex; align-items: center; gap: 7px; padding: 11px 16px; border-bottom: 1px solid rgba(255, 255, 255, .08); }
+  .term-head i { width: 10px; height: 10px; border-radius: 50%; }
+  .term-head i:nth-child(1) { background: #e05d5d; } .term-head i:nth-child(2) { background: #e8b04d; } .term-head i:nth-child(3) { background: #4fc07b; }
+  .term-head span { margin-left: 8px; font-size: 11px; color: #7d8aa0; font-family: var(--mono); }
+  .term-body { padding: 18px 20px; font-family: var(--mono); font-size: 13px; line-height: 2; color: var(--code-ink); }
+  .term-body .cm { color: #5c6b82; }
+  .term-body .cmd { display: flex; align-items: center; gap: 10px; }
+  .term-body .cmd code { flex: 1; overflow-x: auto; white-space: nowrap; }
+  .term-body .p { color: #6f86b8; }
+  .copy-btn {
+    flex: none; display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(255, 255, 255, .1); border: 1px solid rgba(255, 255, 255, .16); color: var(--code-ink);
+    border-radius: 8px; padding: 5px 12px; font-size: 12px; cursor: pointer; font-family: var(--font);
+    transition: background .16s ease, border-color .16s ease;
+  }
+  .copy-btn:hover { background: rgba(255, 255, 255, .18); }
+  .copy-btn.ok { border-color: rgba(79, 192, 123, .6); color: #7fdca3; }
+  .steps { display: flex; flex-direction: column; gap: 14px; margin: 0; padding: 0; list-style: none; }
+  .steps li { display: flex; gap: 12px; align-items: flex-start; font-size: 14px; color: var(--ink-2); }
+  .steps b { color: var(--ink); }
+  .steps .n { flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; margin-top: 1px; }
+
+  /* ── 说明与页脚 ── */
+  .notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; }
+  .note b { display: block; font-size: 14px; margin-bottom: 6px; }
+  .note p { margin: 0; font-size: 13px; color: var(--ink-2); }
+  .footer { border-top: 1px solid var(--border); margin-top: 24px; padding: 30px 0 44px; }
+  .footer-inner { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: space-between; color: var(--ink-3); font-size: 12.5px; }
+
+  /* ── 移动端 ── */
+  @media (max-width: 860px) {
+    .hero { padding: 56px 0 48px; }
+    .hero-grid { grid-template-columns: 1fr; gap: 28px; }
+    .stage { min-height: 300px; order: -1; }
+    .span-7, .span-5, .span-4, .span-12 { grid-column: span 12; }
+    .gallery { grid-template-columns: 1fr; }
+    .shot.tall { grid-row: auto; }
+    .fee-split { grid-template-columns: 1fr; gap: 28px; }
+    .install-grid { grid-template-columns: 1fr; }
+    .notes { grid-template-columns: 1fr; }
+    .nav-links a:not(.nav-cta) { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .slime, .chip, .chip-a, .chip-b, .chip-c, .cell { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">
+      <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+        <defs><radialGradient id="slime-nav" cx="38%" cy="30%" r="80%"><stop offset="0%" stop-color="#7ea2f7"/><stop offset="55%" stop-color="#4d6bfe"/><stop offset="100%" stop-color="#2f4ad8"/></radialGradient></defs>
+        <path d="M13 2.6c5.9 0 10 3.9 10 9.6 0 6.4-4.5 10.4-10 10.4S3 18.6 3 12.2c0-5.7 4.1-9.6 10-9.6z" fill="url(#slime-nav)"/>
+        <circle cx="9.4" cy="11.6" r="1.7" fill="#0f1420"/><circle cx="16.6" cy="11.6" r="1.7" fill="#0f1420"/>
+        <path d="M10.4 16.2c.7 1.1 1.6 1.7 2.6 1.7s1.9-.6 2.6-1.7" stroke="#0f1420" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+      </svg>
+      dsh-token-stats
+    </a>
+    <div class="nav-links">
+      <a href="#features">功能</a>
+      <a href="#screens">界面</a>
+      <a href="#fees">费用口径</a>
+      <a href="https://github.com/FantasyStarry/dsh-token-stats" target="_blank" rel="noopener">GitHub</a>
+      <a class="btn btn-primary nav-cta" href="#install" style="padding:8px 18px;font-size:13.5px;">安装</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap hero-grid">
+    <div>
+      <h1>DSH 的 token 账本，<br>连费用一起算清</h1>
+      <p>按自然日统计 DeepSeek Harness 每次模型调用的 token 用量，按提供商与模型拆分，并按官方参考价估算费用。悬浮史莱姆宠物把今日消耗挂在屏幕上。</p>
+      <div class="hero-cta">
+        <button class="btn btn-primary" id="hero-copy" type="button">
+          <svg width="15" height="15" viewBox="0 0 256 256" aria-hidden="true"><path fill="currentColor" d="M216 32H88a8 8 0 0 0-8 8v168a8 8 0 0 0 8 8h128a8 8 0 0 0 8-8V40a8 8 0 0 0-8-8zm-8 168H96V48h112zM64 56a8 8 0 0 0-8 8v152a8 8 0 0 0 8 8h104a8 8 0 0 0 0-16H64V64a8 8 0 0 0-8-8z"/></svg>
+          <span>复制安装命令</span>
+        </button>
+        <a class="btn btn-ghost" href="https://github.com/FantasyStarry/dsh-token-stats" target="_blank" rel="noopener">查看 GitHub</a>
+      </div>
+      <div class="hero-meta">
+        <span><span class="dot" style="background:var(--ok)"></span>与会话日志一致</span>
+        <span>366 天历史</span>
+        <span>含子代理对账</span>
+        <span>深色主题适配</span>
+      </div>
+    </div>
+    <div class="stage" aria-hidden="true">
+      <div class="stage-glow"></div>
+      <div class="chip chip-a"><span>今日估算费用</span><strong>¥ 15.65</strong></div>
+      <div class="chip chip-b"><span>缓存命中率</span><strong>96.4%</strong></div>
+      <div class="chip chip-c"><span>官方余额</span><strong>¥ 88.50</strong></div>
+      <svg class="slime" width="230" height="230" viewBox="0 0 230 230">
+        <defs>
+          <radialGradient id="slime-body" cx="36%" cy="26%" r="85%">
+            <stop offset="0%" stop-color="#a8c0fb"/><stop offset="52%" stop-color="#5b82f2"/><stop offset="100%" stop-color="#2f4ad8"/>
+          </radialGradient>
+          <linearGradient id="slime-edge" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#8fb1fb"/><stop offset="100%" stop-color="#2843c9"/></linearGradient>
+        </defs>
+        <ellipse cx="115" cy="206" rx="78" ry="11" fill="rgba(22,25,31,.14)"/>
+        <path d="M115 26c54 0 88 34 88 82 0 54-40 86-88 86s-88-32-88-86c0-48 34-82 88-82z" fill="url(#slime-body)" stroke="url(#slime-edge)" stroke-width="5"/>
+        <path d="M115 26c54 0 88 34 88 82 0 54-40 86-88 86s-88-32-88-86c0-48 34-82 88-82z" fill="none" stroke="rgba(255,255,255,.35)" stroke-width="2" transform="translate(0 1)"/>
+        <ellipse cx="78" cy="82" rx="17" ry="11" fill="rgba(255,255,255,.55)" transform="rotate(-24 78 82)"/>
+        <circle cx="85" cy="120" r="10" fill="#10151f"/><circle cx="145" cy="120" r="10" fill="#10151f"/>
+        <circle cx="88.5" cy="116.5" r="3.4" fill="#fff"/><circle cx="148.5" cy="116.5" r="3.4" fill="#fff"/>
+        <path d="M100 152c6.5 9 13 13.5 15 13.5s8.5-4.5 15-13.5" stroke="#10151f" stroke-width="7" fill="none" stroke-linecap="round"/>
+        <ellipse cx="63" cy="141" rx="11" ry="6.5" fill="rgba(255,255,255,.5)"/>
+        <ellipse cx="167" cy="141" rx="11" ry="6.5" fill="rgba(255,255,255,.5)"/>
+      </svg>
+      <div class="stage-shadow"></div>
+    </div>
+  </div>
+</header>
+
+<section class="section" id="features">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">What it does</p>
+      <h2>一个插件，四处都看得到用量</h2>
+      <p class="sub">从悬浮宠物到设置页报表，从命令行到 CSV 导出，统计口径始终与会话日志一致。</p>
+    </div>
+    <div class="bento">
+      <div class="cell span-7">
+        <h3>悬浮史莱姆宠物</h3>
+        <p>右下角一只圆滚滚的史莱姆，情绪随实时工作状态变化：干活时盯小电脑，空闲时打瞌睡，忙碌到晕眩会有双星环绕。双击还能逗它。</p>
+        <div class="cell-body mood-row">
+          <svg width="104" height="104" viewBox="0 0 230 230" aria-hidden="true">
+            <path d="M115 26c54 0 88 34 88 82 0 54-40 86-88 86s-88-32-88-86c0-48 34-82 88-82z" fill="url(#slime-body)" stroke="url(#slime-edge)" stroke-width="8"/>
+            <circle cx="85" cy="122" r="11" fill="#10151f"/><circle cx="145" cy="122" r="11" fill="#10151f"/>
+            <circle cx="89" cy="118" r="3.6" fill="#fff"/><circle cx="149" cy="118" r="3.6" fill="#fff"/>
+            <path d="M98 154c7 10 14 15 17 15s10-5 17-15" stroke="#10151f" stroke-width="8" fill="none" stroke-linecap="round"/>
+          </svg>
+          <div class="mood-list">
+            <span><i class="dot working"></i>工作中 · 专注盯小电脑</span>
+            <span><i class="dot busy"></i>今日用量大 · 冒汗</span>
+            <span><i class="dot dizzy"></i>用量爆表 · 双星晕眩</span>
+            <span><i class="dot idle"></i>空闲 · 休息眯眼</span>
+            <span><i class="dot sleepy"></i>零请求 · 打瞌睡</span>
+          </div>
+        </div>
+      </div>
+      <div class="cell span-5">
+        <h3>费用估算</h3>
+        <p>内置 DeepSeek 官方参考价，缓存命中 / 未命中 / 输出 / 推理分别计价，未匹配价格自动标出。</p>
+        <div class="cell-body">
+          <div class="fee-big">¥ 15.65<small>今日估算 · 3 个模型</small></div>
+          <svg class="fee-spark" width="100%" height="40" viewBox="0 0 200 40" preserveAspectRatio="none" aria-hidden="true">
+            <path d="M0 32 L28 26 L57 29 L86 18 L114 22 L143 10 L171 14 L200 4 L200 40 L0 40 Z" fill="rgba(59,91,219,.12)"/>
+            <path d="M0 32 L28 26 L57 29 L86 18 L114 22 L143 10 L171 14 L200 4" fill="none" stroke="#3b5bdb" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <div class="fee-note">估算为参考价下限，高峰时段官方价格为 2 倍</div>
+        </div>
+      </div>
+      <div class="cell span-4">
+        <h3>官方余额</h3>
+        <p>调用 DeepSeek 官方 GET /user/balance，与本地估算对照，密钥只留在服务端。</p>
+        <div class="cell-body">
+          <div class="balance-pill"><strong>¥ 88.50</strong><span>CNY · 可调用</span></div>
+        </div>
+      </div>
+      <div class="cell span-4">
+        <h3>活跃热力图</h3>
+        <p>GitHub 风格周网格，按每日计费输入分五档，悬停看当天明细，点击直达那天。</p>
+        <div class="cell-body">
+          <div class="heat" aria-hidden="true">
+            <i class="l1"></i><i class="l3"></i><i class="l0"></i><i class="l2"></i><i class="l4"></i><i class="l1"></i><i class="l0"></i><i class="l2"></i><i class="l3"></i><i class="l0"></i><i class="l1"></i><i class="l4"></i><i class="l2"></i><i class="l0"></i>
+            <i class="l0"></i><i class="l2"></i><i class="l4"></i><i class="l1"></i><i class="l0"></i><i class="l3"></i><i class="l2"></i><i class="l0"></i><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l0"></i><i class="l4"></i><i class="l1"></i>
+            <i class="l3"></i><i class="l0"></i><i class="l1"></i><i class="l4"></i><i class="l2"></i><i class="l0"></i><i class="l1"></i><i class="l3"></i><i class="l0"></i><i class="l2"></i><i class="l4"></i><i class="l1"></i><i class="l0"></i><i class="l2"></i>
+            <i class="l1"></i><i class="l2"></i><i class="l0"></i><i class="l3"></i><i class="l1"></i><i class="l4"></i><i class="l0"></i><i class="l2"></i><i class="l1"></i><i class="l3"></i><i class="l0"></i><i class="l4"></i><i class="l2"></i><i class="l1"></i>
+          </div>
+          <div class="heat-legend"><span>少</span><i style="background:#e8ecf3"></i><i style="background:#c9d4f8"></i><i style="background:#93aaf2"></i><i style="background:#5e7be6"></i><i style="background:#3b5bdb"></i><span>多</span></div>
+        </div>
+      </div>
+      <div class="cell span-4">
+        <h3>/usage 命令</h3>
+        <p>在对话里直接输入，今日用量与估算费用立刻可见，支持最近 N 天区间汇总。</p>
+        <div class="cell-body mini-term">
+          <div><span class="p">$</span> /usage</div>
+          <div>今日 token 用量：输入 4.0M · 输出 2.1M · 共 3 次请求</div>
+          <div>估算费用：<span class="hl">¥15.65</span> · 官方余额：<span class="hl">¥88.50</span></div>
+        </div>
+      </div>
+      <div class="cell span-12">
+        <h3>报表与导出</h3>
+        <p>设置页「用量统计」分区：概览卡 + 提供商汇总 + 模型明细 + 会话对账 + 近 7 天 / 30 天逐日表；日期导航可回看任意一天，一键导出 CSV（带 BOM，Excel 直接打开不乱码）。</p>
+        <div class="cell-body chip-flow">
+          <span class="mini-chip">提供商汇总 chips</span>
+          <span class="mini-chip">模型明细表</span>
+          <span class="mini-chip">顶层 + 子代理对账</span>
+          <span class="mini-chip">近 7 天柱状图</span>
+          <span class="mini-chip">近 30 天折叠表</span>
+          <span class="mini-chip">CSV 导出</span>
+          <span class="mini-chip">日期导航 ‹ ›</span>
+          <span class="mini-chip">深色主题</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="screens">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>长这样</h2>
+      <p class="sub">设置页用量统计（浅色）、活跃热力图（深色）与悬浮宠物弹窗。</p>
+    </div>
+    <div class="gallery">
+      <figure class="shot tall">
+        <img src="pet-popup.png" alt="悬浮史莱姆宠物弹窗：今日用量面板" loading="lazy">
+        <figcaption>宠物弹窗：今日用量 + 迷你热力图 + 7 天柱状图</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="settings-light.png" alt="设置页用量统计浅色视图" loading="lazy">
+        <figcaption>设置页「用量统计」：概览卡 + 费用 + 模型明细</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="settings-dark-heat.png" alt="活跃热力图深色视图" loading="lazy">
+        <figcaption>活跃热力图（深色）：周 × 星期网格，悬停看当天明细</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="fees">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>费用怎么算的</h2>
+      <p class="sub">token 统计是真实的，费用是估算的。口径如下，想精确对账就看官方后台。</p>
+    </div>
+    <div class="fee-split">
+      <ul class="points">
+        <li>
+          <span class="n">1</span>
+          <div><b>按模型参考价分别计价</b><p>缓存命中、未命中、输出、推理各按各的单价，与官方计费规则一致。</p></div>
+        </li>
+        <li>
+          <span class="n">2</span>
+          <div><b>内置 DeepSeek 官方空闲时段价</b><p>高峰时段为 2 倍，因此估算费用是下限值，实际以官方账单为准。</p></div>
+        </li>
+        <li>
+          <span class="n">3</span>
+          <div><b>价格可覆盖，模型名前缀匹配</b><p>插件配置里的 prices 表按模型设置单价，deepseek-v4-flash-0731 这类带版本后缀的模型名会自动命中。</p></div>
+        </li>
+        <li>
+          <span class="n">4</span>
+          <div><b>官方余额双通道对照</b><p>配置 DEEPSEEK_API_KEY 后调用官方余额接口，与本地估算并排展示；未配置时自动隐藏，不影响其他功能。</p></div>
+        </li>
+      </ul>
+      <table class="price-table">
+        <thead>
+          <tr><th>模型</th><th>缓存命中</th><th>缓存未命中</th><th>输出</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>deepseek-v4-flash</td><td class="num">¥0.05</td><td class="num">¥1.50</td><td class="num">¥4.50</td></tr>
+          <tr><td>deepseek-v4-flash-vision-exp</td><td class="num">¥0.05</td><td class="num">¥1.50</td><td class="num">¥4.50</td></tr>
+          <tr><td>deepseek-v4-pro</td><td class="num">¥0.15</td><td class="num">¥4.50</td><td class="num">¥13.50</td></tr>
+          <tr><td>deepseek-chat（旧）</td><td class="num">¥0.50</td><td class="num">¥2.00</td><td class="num">¥8.00</td></tr>
+          <tr><td>deepseek-reasoner（旧）</td><td class="num">¥1.00</td><td class="num">¥4.00</td><td class="num">¥16.00</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="install">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Install</p>
+      <h2>三条命令装好</h2>
+      <p class="sub">推荐从 GitHub 安装并锁定版本标签，升级时打新标签即可。</p>
+    </div>
+    <div class="install-grid">
+      <div class="term">
+        <div class="term-head"><i></i><i></i><i></i><span>dsh-token-stats · install</span></div>
+        <div class="term-body">
+          <div class="cmd">
+            <span class="p">$</span>
+            <code id="install-cmd">dsh plugin --profile web add "github:FantasyStarry/dsh-token-stats#v0.10.0"</code>
+            <button class="copy-btn" id="copy-btn" type="button">
+              <svg width="13" height="13" viewBox="0 0 256 256" aria-hidden="true"><path fill="currentColor" d="M216 32H88a8 8 0 0 0-8 8v168a8 8 0 0 0 8 8h128a8 8 0 0 0 8-8V40a8 8 0 0 0-8-8zm-8 168H96V48h112zM64 56a8 8 0 0 0-8 8v152a8 8 0 0 0 8 8h104a8 8 0 0 0 0-16H64V64a8 8 0 0 0-8-8z"/></svg>
+              <span>复制</span>
+            </button>
+          </div>
+          <div class="cm"># 在 $DSH_HOME/profiles/web/cordis.patch.yml 中激活：</div>
+          <div><span class="cm">- insert:</span> <span class="cm"># 该行下方添加</span></div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;- id: token-stats</div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;name: dsh-token-stats</div>
+          <div class="cm"># 重启 dsh web 生效，刷新浏览器页面加载客户端插件</div>
+        </div>
+      </div>
+      <ol class="steps">
+        <li><span class="n">1</span><div><b>添加插件</b>，锁定版本标签 <span class="mono">#v0.10.0</span></div></li>
+        <li><span class="n">2</span><div><b>激活</b>：在 web profile 的 cordis.patch.yml 里 insert 一行</div></li>
+        <li><span class="n">3</span><div><b>重启 dsh web</b>，刷新浏览器；可选在插件配置里加 <span class="mono">prices</span> 单价表</div></li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<section class="section" style="padding-bottom: 8px;">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>数据口径说明</h2>
+    </div>
+    <div class="notes">
+      <div class="note">
+        <b>与日志一致</b>
+        <p>每次成功模型调用计一次，失败与重试不计；插件每次加载会把今天的统计从会话日志整体重建，不漏计也不重复。</p>
+      </div>
+      <div class="note">
+        <b>费用是估算</b>
+        <p>按内置参考价或你配置的价格估算，DeepSeek 官方价格随时可能调整，对账以平台账单为准。</p>
+      </div>
+      <div class="note">
+        <b>密钥安全</b>
+        <p>API Key 只在服务端使用，浏览器只访问本机路由，不会下发任何密钥。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <span>dsh-token-stats · 为 DeepSeek Harness 打造的用量统计插件</span>
+    <span><a href="https://github.com/FantasyStarry/dsh-token-stats" target="_blank" rel="noopener">GitHub</a> · MIT License</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var cmd = document.getElementById("install-cmd");
+  var btn = document.getElementById("copy-btn");
+  var heroBtn = document.getElementById("hero-copy");
+  function copyText(text, el, okText) {
+    function done() {
+      el.classList.add("ok");
+      var span = el.querySelector("span");
+      if (span) span.textContent = okText;
+      setTimeout(function () {
+        el.classList.remove("ok");
+        if (span) span.textContent = "复制";
+      }, 1600);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, done);
+    } else {
+      var t = document.createElement("textarea");
+      t.value = text;
+      document.body.appendChild(t);
+      t.select();
+      try { document.execCommand("copy"); } catch (e) {}
+      document.body.removeChild(t);
+      done();
+    }
+  }
+  btn.addEventListener("click", function () { copyText(cmd.textContent.trim(), btn, "已复制"); });
+  heroBtn.addEventListener("click", function () { copyText(cmd.textContent.trim(), heroBtn, "已复制"); });
+})();
+</script>
+</body>
+</html>
