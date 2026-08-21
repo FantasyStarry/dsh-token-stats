@@ -22,8 +22,13 @@
  * 提供：
  *  - 持久化：原子写入 $DSH_HOME/storages/token-stats.json（可用 config.storagePath 覆盖）
  *  - HTTP：GET /token-stats/summary?day=YYYY-MM-DD、GET /token-stats/history?days=N、
- *    GET /token-stats/sessions?day=YYYY-MM-DD —— 按会话明细（含子代理标记）
- *  - 命令：/usage —— 今日用量文本
+ *    GET /token-stats/sessions?day=YYYY-MM-DD —— 按会话明细（含子代理标记）、
+ *    GET /token-stats/balance —— 官方余额（GET /user/balance，Bearer DEEPSEEK_API_KEY，
+ *    60s 缓存；未配置密钥时返回 ok:false + error 字段，客户端优雅降级）
+ *  - 命令：/usage —— 今日用量 + 估算费用 + 官方余额
+ *  - 费用：按模型参考价表（config.prices 可覆盖，支持前缀匹配）估算费用，
+ *    内置 DeepSeek 官方空闲时段价（高峰 ×2，估算为"至少"值）；未计价模型
+ *    在汇总中 cost:null / unpriced 计数，UI 显示"—"
  *
  * 按会话口径（v0.3.0 新增）：每份会话日志的头事件携带 parentSession / origin /
  * delegationDepth（见 dsh-session-persistence-jsonl 的 toHeaderLine）。会话的
@@ -137,14 +142,37 @@ interface CompletionEvent {
 interface CordisLike {
   on(event: string, listener: (...args: any[]) => void): void;
   inject(services: string[], cb: (svc: any) => void): void;
+  get?(name: string): any;
   logger?: { info?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void };
   fiber?: { state?: string };
+}
+
+/** 单价表（元/百万 token）。缺省字段继承模型族默认：cacheWrite = input，reasoning = output。 */
+interface Price {
+  input?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  output?: number;
+  reasoning?: number;
 }
 
 /** 插件配置（schema 见 Config）。 */
 interface PluginConfig {
   storagePath?: string;
   keepDays?: number;
+  prices?: Record<string, Price>;
+}
+
+/** 附加费用视图的统计（cost = null 表示该模型未计价）。 */
+interface PricedStats extends Stats {
+  cost: number | null;
+}
+
+/** 附加费用视图的某日汇总（unpriced = 未计价模型个数）。 */
+interface DaySummaryView {
+  day: string;
+  total: PricedStats & { unpriced: number };
+  providers: Record<string, { total: PricedStats & { unpriced: number }; models: Record<string, PricedStats> }>;
 }
 
 // 可选依赖（DSH 自带包）：驱动设置页"插件配置"表单。解析不到（如独立测试环境）
@@ -168,7 +196,14 @@ try {
  */
 const Config = z ? z.object({
   storagePath: z.string().default("").description("统计文件路径；留空使用默认 $DSH_HOME/storages/token-stats.json"),
-  keepDays: z.number().step(1).min(1).max(3650).default(366).description("历史保留天数")
+  keepDays: z.number().step(1).min(1).max(3650).default(366).description("历史保留天数"),
+  prices: z.dict(z.object({
+    input: z.number().step(0.01).min(0).required(false).description("未缓存输入单价（元/百万 token）"),
+    cacheRead: z.number().step(0.01).min(0).required(false).description("缓存命中单价（元/百万 token）"),
+    cacheWrite: z.number().step(0.01).min(0).required(false).description("缓存写单价；缺省 = 未缓存输入"),
+    output: z.number().step(0.01).min(0).required(false).description("输出单价（元/百万 token）"),
+    reasoning: z.number().step(0.01).min(0).required(false).description("推理单价；缺省 = 输出")
+  })).default({}).description("按模型单价表（元/百万 token）；键支持前缀匹配，覆盖内置 DeepSeek 参考价（空闲时段价，高峰 ×2）")
 }) : null;
 /** 本插件 settings 命名空间。 */
 const STATS_SETTINGS_NAMESPACE = settingsNamespace ? settingsNamespace("token-stats") : null;
@@ -444,6 +479,245 @@ function collectTodayUsage(start: number): TodayEvent[] {
   return events;
 }
 
+// ── 费用估算（按模型参考价，纯函数，便于独立测试） ────────────────────────
+
+/**
+ * 内置参考价（元/百万 token，DeepSeek 官方空闲时段价；高峰时段为 2 倍，
+ * 故估算为"至少"值）。来源：https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+ *  - deepseek-v4-flash / -vision-exp：命中 0.05 · 未命中 1.5 · 输出 4.5
+ *  - deepseek-v4-pro：命中 0.15 · 未命中 4.5 · 输出 13.5
+ *  - deepseek-chat / deepseek-reasoner（旧版参考价）：2/0.5/8 与 4/1/16
+ * 键统一小写存储；用户可在 config.prices 按模型覆盖（键支持前缀匹配）。
+ */
+const BUILTIN_PRICES: Record<string, Price> = {
+  "deepseek-v4-flash": { input: 1.5, cacheRead: 0.05, output: 4.5 },
+  "deepseek-v4-flash-vision-exp": { input: 1.5, cacheRead: 0.05, output: 4.5 },
+  "deepseek-v4-pro": { input: 4.5, cacheRead: 0.15, output: 13.5 },
+  "deepseek-chat": { input: 2, cacheRead: 0.5, output: 8 },
+  "deepseek-reasoner": { input: 4, cacheRead: 1, output: 16 }
+};
+
+/** 归一化单价表：内置参考价 + 用户覆盖（键统一小写）。 */
+function normalizePrices(user?: Record<string, Price>): Record<string, Price> {
+  const table: Record<string, Price> = {};
+  for (const [key, value] of Object.entries(BUILTIN_PRICES)) {
+    table[key] = { ...value };
+  }
+  if (user && typeof user === "object") {
+    for (const [key, value] of Object.entries(user)) {
+      if (!value || typeof value !== "object") continue;
+      const lower = key.toLowerCase();
+      table[lower] = { ...(table[lower] || {}), ...value };
+    }
+  }
+  return table;
+}
+
+/**
+ * 查询模型单价：精确（小写）优先，其次最长前缀匹配（带边界分隔符），
+ * 如 deepseek-v4-flash-0731 / DeepSeek-V4-Flash-0731 → deepseek-v4-flash。
+ * 未匹配返回 null（客户端显示"—"）。
+ */
+function resolvePrice(model: string, table: Record<string, Price>): Price | null {
+  const m = String(model || "").toLowerCase();
+  if (!m) return null;
+  const exact = table[m];
+  if (exact) return exact;
+  let best: { key: string; price: Price } | null = null;
+  for (const [key, price] of Object.entries(table)) {
+    if (!m.startsWith(key)) continue;
+    const next = m[key.length];
+    if (next !== undefined && next !== "-" && next !== "/" && next !== "." && next !== "_") continue;
+    if (!best || key.length > best.key.length) best = { key, price };
+  }
+  return best ? best.price : null;
+}
+
+/** 计算一笔统计的费用（元）。未匹配到价格返回 null。 */
+function computeCost(stats: Stats, price: Price | null): number | null {
+  if (!price) return null;
+  const input = Number(price.input ?? 0);
+  const cacheRead = Number(price.cacheRead ?? 0);
+  const cacheWrite = Number(price.cacheWrite ?? input);
+  const output = Number(price.output ?? 0);
+  const reasoning = Number(price.reasoning ?? output);
+  return (
+    stats.inputTokens * input +
+    stats.cacheReadTokens * cacheRead +
+    stats.cacheWriteTokens * cacheWrite +
+    stats.outputTokens * output +
+    stats.reasoningTokens * reasoning
+  ) / 1e6;
+}
+
+/** 给某日汇总附加费用视图（每模型 cost；提供商/全天合计 + unpriced 计数）。 */
+function enrichSummary(summary: DaySummary, table: Record<string, Price>): DaySummaryView {
+  const providers: DaySummaryView["providers"] = {};
+  let dayCost = 0;
+  let dayUnpriced = 0;
+  let anyPriced = false;
+  for (const [provider, pv] of Object.entries(summary.providers)) {
+    const models: Record<string, PricedStats> = {};
+    let provCost = 0;
+    let provUnpriced = 0;
+    let provPriced = false;
+    for (const [model, stats] of Object.entries(pv.models)) {
+      const price = resolvePrice(model, table);
+      const cost = computeCost(stats, price);
+      models[model] = { ...stats, cost };
+      if (cost === null) {
+        provUnpriced += 1;
+      } else {
+        provCost += cost;
+        provPriced = true;
+      }
+    }
+    providers[provider] = {
+      total: { ...pv.total, cost: provPriced ? provCost : null, unpriced: provUnpriced },
+      models
+    };
+    if (provPriced) {
+      dayCost += provCost;
+      anyPriced = true;
+    }
+    dayUnpriced += provUnpriced;
+  }
+  return {
+    day: summary.day,
+    total: { ...summary.total, cost: anyPriced ? dayCost : null, unpriced: dayUnpriced },
+    providers
+  };
+}
+
+// ── /usage 命令文案（纯函数，便于独立测试） ──────────────────────────────
+
+/** 数字缩写（k/m/b）。 */
+function fmtCompact(n: number | string | null | undefined): string {
+  const v = Number(n || 0);
+  if (Math.abs(v) >= 1e9) return `${(v / 1e9).toFixed(1)}B`;
+  if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
+  return Number.isInteger(v) ? String(v) : String(Math.round(v * 10) / 10);
+}
+
+/** 金额（元）：<1 万保留两位小数，大额 k/M 缩写。 */
+function fmtMoney(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  if (abs >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (abs >= 1e4) return `${(n / 1e3).toFixed(1)}k`;
+  return n.toFixed(2);
+}
+
+/** 近 7 天趋势条：▁▂▃▄▅▆▇█ 按当日计费输入占最大日的比例分档，零用量日记 ·。 */
+function trendBars(days: { day: string; total: Stats }[]): { bars: string; total: number; today: number } {
+  const ordered = [...days].reverse();
+  const billedOf = (d: { total: Stats }): number => d.total.inputTokens + d.total.cacheReadTokens + d.total.cacheWriteTokens;
+  const max = Math.max(0, ...ordered.map(billedOf));
+  const blocks = "▁▂▃▄▅▆▇█";
+  const bars = ordered
+    .map((d) => {
+      const v = billedOf(d);
+      if (v <= 0) return "·";
+      const lv = Math.max(1, Math.min(8, Math.ceil((v / Math.max(1, max)) * 8)));
+      return blocks[lv - 1];
+    })
+    .join("");
+  return {
+    bars,
+    total: ordered.reduce((a, d) => a + billedOf(d), 0),
+    today: ordered.length > 0 ? billedOf(ordered[ordered.length - 1]) : 0
+  };
+}
+
+/** 生成 /usage 命令文本（区间汇总 + 每日趋势 + 子代理对账 + 按模型明细 + 估算费用）。days = 统计最近几天（1 = 仅今天）。 */
+function buildUsageText(state: StatsState, days = 1, prices: Record<string, Price> = normalizePrices()): string {
+  const span = Math.max(1, Math.min(366, Math.floor(days)));
+  const today = dateKeyOf(Date.now());
+  const startDay = dateKeyOf(Date.now() - (span - 1) * 86400000);
+  const billedOf = (s: Stats): number => s.inputTokens + s.cacheReadTokens + s.cacheWriteTokens;
+  const total = blankStats();
+  const providers: Record<string, Record<string, Stats>> = {};
+  const dayKeys: string[] = [];
+  let costTotal = 0;
+  let unpriced = 0;
+  let anyPriced = false;
+  for (let i = 0; i < span; i++) {
+    const key = dateKeyOf(Date.now() - i * 86400000);
+    dayKeys.push(key);
+    const dayData = state.days[key];
+    if (!dayData) continue;
+    for (const [p, models] of Object.entries(dayData)) {
+      for (const [m, ms] of Object.entries(models)) {
+        addStats(total, ms);
+        const bucket = ((providers[p] ??= {})[m] ??= blankStats());
+        addStats(bucket, ms);
+        const cost = computeCost(ms, resolvePrice(m, prices));
+        if (cost === null) {
+          unpriced += 1;
+        } else {
+          costTotal += cost;
+          anyPriced = true;
+        }
+      }
+    }
+  }
+  const billedInput = billedOf(total);
+  const extra = total.reasoningTokens > 0 ? ` · 推理 ${fmtCompact(total.reasoningTokens)}` : "";
+  const lines = [
+    span === 1 ? `今日（${today}）token 用量：` : `近 ${span} 天（${startDay} ~ ${today}）token 用量：`,
+    `总计：输入 ${fmtCompact(billedInput)}（缓存读 ${fmtCompact(total.cacheReadTokens)}）· 输出 ${fmtCompact(total.outputTokens)}${extra} · 共 ${total.requests} 次请求`
+  ];
+  if (total.requests > 0) {
+    if (anyPriced) {
+      const note = unpriced > 0 ? `（${unpriced} 个模型未计价）` : "";
+      lines.push(`估算费用：¥${fmtMoney(costTotal)}${note}`);
+    } else {
+      lines.push(`估算费用：—（全部模型未计价，可在 插件配置 的 prices 中设置参考价）`);
+    }
+  }
+  if (span === 1) {
+    const t7 = trendBars(historyFor(state, 7).days);
+    lines.push(`近 7 天趋势 ${t7.bars} 合计 ${fmtCompact(t7.total)}（今日 ${fmtCompact(t7.today)}）`);
+  } else {
+    const trend = trendBars(historyFor(state, span).days);
+    lines.push(`每日趋势 ${trend.bars} 合计 ${fmtCompact(trend.total)}`);
+  }
+  let subCount = 0;
+  let subReqs = 0;
+  let subBilled = 0;
+  for (const key of dayKeys) {
+    const daySessions = state.sessions[key] || {};
+    for (const s of Object.values(daySessions)) {
+      if (!s.subagent) continue;
+      subCount += 1;
+      subReqs += s.requests;
+      subBilled += billedOf(s);
+    }
+  }
+  if (subCount > 0) {
+    lines.push(`其中子代理会话 ${fmtCompact(subBilled)}（${subReqs} 次请求 · ${subCount} 个会话；GUI 会话列表不显示子代理）`);
+  }
+  const providerRows = Object.entries(providers)
+    .map(([p, models]) => {
+      const agg = blankStats();
+      for (const ms of Object.values(models)) addStats(agg, ms);
+      return { p, models, billed: billedOf(agg) };
+    })
+    .sort((a, b) => b.billed - a.billed);
+  for (const { p, models } of providerRows) {
+    for (const [m, ms] of Object.entries(models).sort((a, b) => billedOf(b[1]) - billedOf(a[1]))) {
+      const billed = billedOf(ms);
+      const mExtra = ms.reasoningTokens > 0 ? ` · 推理 ${fmtCompact(ms.reasoningTokens)}` : "";
+      lines.push(`- ${p} / ${m}：输入 ${fmtCompact(billed)} · 输出 ${fmtCompact(ms.outputTokens)}${mExtra} · ${ms.requests} 次请求`);
+    }
+  }
+  if (total.requests === 0) {
+    lines.push(span === 1 ? "（今天还没有记录到模型调用）" : `（${startDay} 以来还没有记录到模型调用）`);
+  }
+  return lines.join("\n");
+}
+
 export default {
   name: "dsh-token-stats",
 
@@ -452,18 +726,22 @@ export default {
    * @param config - { storagePath?: string, keepDays?: number }
    */
   apply(ctx: CordisLike, config: PluginConfig = {}) {
-    let current = () => config;
+    let current: () => any = () => config;
     let storagePath = config.storagePath || defaultStoragePath();
     let keepDays =
       typeof config.keepDays === "number" && Number.isInteger(config.keepDays) && config.keepDays > 0
         ? config.keepDays
         : 366;
     let state = loadState(storagePath);
+    /** 归一化单价表（内置参考价 + 用户覆盖），随配置实时更新。 */
+    let priceTable = normalizePrices(config.prices);
     let dirty = false;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let lastFlushAt = 0;
     /** 上次实时活动的时刻（仅实时订阅更新，重建不触发），0 = 尚无活动。 */
     let lastActivityAt = 0;
+    /** 官方余额响应缓存（60s），避免客户端轮询打到 DeepSeek。 */
+    let balanceCache: { at: number; status: number; body: unknown } | null = null;
     /** 最近完成的模型调用（内存环形缓冲，约 60s / 20 条）。 */
     const recentCompletions: CompletionEvent[] = [];
 
@@ -640,6 +918,7 @@ export default {
             }
           }
           if (nextKeep !== keepDays) keepDays = nextKeep;
+          priceTable = normalizePrices(next.prices);
         }
       });
     }
@@ -655,7 +934,7 @@ export default {
       res.end(payload);
     };
 
-    const handleHttp = (req: IncomingMessage, res: ServerResponse): void => {
+    const handleHttp = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
       let url: URL;
       try {
         url = new URL(req.url || "/", "http://localhost");
@@ -667,13 +946,85 @@ export default {
       if (path === "/token-stats/summary") {
         const day = url.searchParams.get("day") || dateKeyOf(Date.now());
         writeJson(res, 200, {
-          ...summaryFor(state, day),
+          ...enrichSummary(summaryFor(state, day), priceTable),
           activity: { lastAt: lastActivityAt, completions: recentCompletions }
         });
       } else if (path === "/token-stats/history") {
         const parsed = Number(url.searchParams.get("days"));
-        const days = Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 30) : 7;
-        writeJson(res, 200, historyFor(state, days));
+        // 上限 366：活跃热力图按周×星期渲染近 12 个月（v0.9.2）
+        const days = Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 366) : 7;
+        const hist = historyFor(state, days);
+        writeJson(res, 200, {
+          days: hist.days.map((d) => {
+            const enriched = enrichSummary(summaryFor(state, d.day), priceTable);
+            return { day: d.day, total: enriched.total };
+          })
+        });
+      } else if (path === "/token-stats/balance") {
+        // 官方余额（GET /user/balance，Bearer DEEPSEEK_API_KEY；60s 缓存）
+        if (balanceCache && Date.now() - balanceCache.at < 60000) {
+          writeJson(res, balanceCache.status, balanceCache.body);
+          return;
+        }
+        const creds = ctx.get ? ctx.get("credentials") : undefined;
+        if (!creds || typeof creds.resolve !== "function") {
+          balanceCache = { at: Date.now(), status: 503, body: { ok: false, error: "no-credentials", message: "credentials 服务不可用" } };
+          writeJson(res, 503, balanceCache.body);
+          return;
+        }
+        try {
+          const hit = await creds.resolve("DEEPSEEK_API_KEY");
+          if (!hit || !hit.value) {
+            balanceCache = { at: Date.now(), status: 200, body: { ok: false, error: "no-api-key", message: "未配置 DEEPSEEK_API_KEY（设置 → 模型）" } };
+            writeJson(res, 200, balanceCache.body);
+            return;
+          }
+          const response = await fetch("https://api.deepseek.com/user/balance", {
+            headers: { Authorization: `Bearer ${hit.value}`, Accept: "application/json" },
+            signal: AbortSignal.timeout(10000)
+          });
+          const text = await response.text();
+          if (!response.ok) {
+            balanceCache = { at: Date.now(), status: response.status, body: { ok: false, error: "provider", message: `DeepSeek 接口返回 HTTP ${response.status}` } };
+            writeJson(res, response.status, balanceCache.body);
+            return;
+          }
+          let data: any = null;
+          try {
+            data = JSON.parse(text);
+          } catch {
+            // 非 JSON 响应：按失败处理
+          }
+          if (!data || typeof data !== "object") {
+            balanceCache = { at: Date.now(), status: 502, body: { ok: false, error: "bad-response", message: "余额接口返回异常" } };
+            writeJson(res, 502, balanceCache.body);
+            return;
+          }
+          const infos = Array.isArray(data.balance_infos) ? data.balance_infos : [];
+          const total = infos.reduce((a: number, i: any) => a + (Number(i && i.total_balance) || 0), 0);
+          const body = {
+            ok: true,
+            isAvailable: !!data.is_available,
+            currency: infos.length > 0 ? String(infos[0].currency || "CNY") : "CNY",
+            total,
+            infos: infos.map((i: any) => ({
+              currency: i && i.currency,
+              total: i && i.total_balance,
+              granted: i && i.granted_balance,
+              toppedUp: i && i.topped_up_balance
+            })),
+            fetchedAt: Date.now()
+          };
+          balanceCache = { at: Date.now(), status: 200, body };
+          writeJson(res, 200, body);
+        } catch (error) {
+          balanceCache = {
+            at: Date.now(),
+            status: 502,
+            body: { ok: false, error: "fetch-failed", message: error instanceof Error ? error.message : String(error) }
+          };
+          writeJson(res, 502, balanceCache.body);
+        }
       } else if (path === "/token-stats/sessions") {
         const day = url.searchParams.get("day") || dateKeyOf(Date.now());
         const daySessions = state.sessions[day] || {};
@@ -698,7 +1049,8 @@ export default {
           endpoints: [
             "/token-stats/summary?day=YYYY-MM-DD",
             "/token-stats/history?days=N",
-            "/token-stats/sessions?day=YYYY-MM-DD"
+            "/token-stats/sessions?day=YYYY-MM-DD",
+            "/token-stats/balance"
           ]
         });
       }
@@ -713,52 +1065,42 @@ export default {
       ctx.on("dispose", dispose);
     });
 
-    // ── /usage 命令（对话内直接查询，数字用 k/m/b 缩写） ───────────────────
-    const fmtCompact = (n: number | string | null | undefined): string => {
-      const v = Number(n || 0);
-      if (Math.abs(v) >= 1e9) return `${(v / 1e9).toFixed(1)}B`;
-      if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
-      if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
-      return Number.isInteger(v) ? String(v) : String(Math.round(v * 10) / 10);
-    };
-
-    const commandText = () => {
-      const day = dateKeyOf(Date.now());
-      const summary = summaryFor(state, day);
-      const t = summary.total;
-      const billedInput = t.inputTokens + t.cacheReadTokens + t.cacheWriteTokens;
-      const extra = t.reasoningTokens > 0 ? ` · 推理 ${fmtCompact(t.reasoningTokens)}` : "";
-      const lines = [
-        `今日（${day}）token 用量：`,
-        `总计：输入 ${fmtCompact(billedInput)}（缓存读 ${fmtCompact(t.cacheReadTokens)}）· 输出 ${fmtCompact(t.outputTokens)}${extra} · 共 ${t.requests} 次请求`
-      ];
-      const daySessions = state.sessions[day] || {};
-      const subSessions = Object.values(daySessions).filter((s) => s.subagent);
-      if (subSessions.length > 0) {
-        const subBilled = subSessions.reduce((a, s) => a + s.inputTokens + s.cacheReadTokens + s.cacheWriteTokens, 0);
-        const subReqs = subSessions.reduce((a, s) => a + s.requests, 0);
-        lines.push(
-          `其中子代理会话 ${fmtCompact(subBilled)}（${subReqs} 次请求 · ${subSessions.length} 个会话；GUI 会话列表不显示子代理）`
-        );
-      }
-      for (const [provider, pv] of Object.entries(summary.providers)) {
-        for (const [model, ms] of Object.entries(pv.models)) {
-          const billed = ms.inputTokens + ms.cacheReadTokens + ms.cacheWriteTokens;
-          const mExtra = ms.reasoningTokens > 0 ? ` · 推理 ${fmtCompact(ms.reasoningTokens)}` : "";
-          lines.push(
-            `- ${provider} / ${model}：输入 ${fmtCompact(billed)} · 输出 ${fmtCompact(ms.outputTokens)}${mExtra} · ${ms.requests} 次请求`
-          );
-        }
-      }
-      if (Object.keys(summary.providers).length === 0) lines.push("（今天还没有记录到模型调用）");
-      return lines.join("\n");
-    };
-
     ctx.inject(["commands"], (cmd) => {
       const dispose = cmd.commands.register({
         name: "usage",
-        description: "查看今日 LLM token 用量（按提供商/模型）",
-        handler: () => ({ kind: "success", text: commandText() })
+        description: "查看 LLM token 用量与估算费用（/usage 今天 · /usage 7 近 7 天，按提供商/模型）",
+        input: { hint: "[天数，缺省 1=今天，最大 366]" },
+        handler: async (invocation?: { rawInput?: string }) => {
+          const raw = invocation && typeof invocation.rawInput === "string" ? invocation.rawInput.trim() : "";
+          const parsed = Number(raw);
+          const days = raw === "" || !Number.isFinite(parsed) ? 1 : Math.max(1, Math.min(366, Math.floor(parsed)));
+          const text = buildUsageText(state, days, priceTable);
+          // 附官方余额（可选：仅当 credentials 可解析出 DEEPSEEK_API_KEY；失败静默）
+          let textWithBalance = text;
+          try {
+            const creds = ctx.get ? ctx.get("credentials") : undefined;
+            if (creds && typeof creds.resolve === "function") {
+              const hit = await creds.resolve("DEEPSEEK_API_KEY");
+              if (hit && hit.value) {
+                const response = await fetch("https://api.deepseek.com/user/balance", {
+                  headers: { Authorization: `Bearer ${hit.value}`, Accept: "application/json" },
+                  signal: AbortSignal.timeout(10000)
+                });
+                if (response.ok) {
+                  const data = await response.json();
+                  const infos = Array.isArray(data && data.balance_infos) ? data.balance_infos : [];
+                  if (infos.length > 0) {
+                    const total = infos.reduce((a: number, i: any) => a + (Number(i && i.total_balance) || 0), 0);
+                    textWithBalance += `\n官方余额：¥${fmtMoney(total)}（${String(infos[0].currency || "CNY")} · GET /user/balance）`;
+                  }
+                }
+              }
+            }
+          } catch {
+            // 余额查询失败不影响 /usage 主输出
+          }
+          return { kind: "success", text: textWithBalance };
+        }
       });
       ctx.on("dispose", dispose);
     });

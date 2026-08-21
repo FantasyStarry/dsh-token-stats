@@ -143,8 +143,26 @@ const TODAY_KEY = localDayKey(today);
   check("A4 history HTTP", h.status === 200 && h.body.days.length === 3 && h.body.days[0].total.requests === 3);
   const nf = await call("/token-stats/other");
   check("A5 404 HTTP", nf.status === 404);
-  const cmd = commands[0].handler();
+  const cmd = await commands[0].handler();
   check("A6 /usage 命令", commands[0].name === "usage" && cmd.kind === "success" && cmd.text.includes("共 3 次请求"));
+  const trendLine = cmd.text.split("\n").find((l) => l.startsWith("近 7 天趋势"));
+  const barsMatch = trendLine ? trendLine.match(/近 7 天趋势 (\S+) 合计/) : null;
+  check("A6b /usage 近 7 天趋势条（7 格，今日非空）",
+    !!barsMatch && barsMatch[1].length === 7 && /^[·▁▂▃▄▅▆▇█]{7}$/.test(barsMatch[1]) && !barsMatch[1].endsWith("·"),
+    trendLine || "");
+  const cmd7 = await commands[0].handler({ rawInput: "7" });
+  check("A6c /usage 7（近 7 天区间汇总）",
+    cmd7.text.includes("近 7 天（") && cmd7.text.includes("共 4 次请求") && /每日趋势 [·▁▂▃▄▅▆▇█]{7} 合计/.test(cmd7.text),
+    cmd7.text.split("\n")[0] || "");
+  const cmdBad = await commands[0].handler({ rawInput: "abc" });
+  check("A6d /usage 非法参数回退今天", cmdBad.text.startsWith(`今日（`) && cmdBad.text.includes("共 3 次请求"));
+  const aCost = 300 * 1.5 / 1e6 + 10 * 0.05 / 1e6 + 130 * 4.5 / 1e6 + 5 * 4.5 / 1e6 + 30 * 4.5 / 1e6 + 10 * 13.5 / 1e6;
+  check("A6e /usage 估算费用（deepseek 参考价，全部已计价）",
+    cmd.text.includes(`估算费用：¥${aCost.toFixed(2)}`) && cmd.text.includes("全部模型未计价") === false,
+    cmd.text.split("\n").find((l) => l.startsWith("估算费用")) || "");
+  const bal = await call("/token-stats/balance");
+  check("A6f balance 无 credentials 时优雅降级（503 no-credentials）",
+    bal.status === 503 && bal.body.ok === false && bal.body.error === "no-credentials", JSON.stringify(bal.body));
   const ss = await call("/token-stats/sessions");
   check("A7 sessions HTTP（实时会话 s 记为顶层）",
     ss.status === 200 && ss.body.sessions.length === 1 && ss.body.sessions[0].id === "s" && ss.body.sessions[0].subagent === false,
@@ -276,7 +294,7 @@ const TODAY_KEY = localDayKey(today);
     JSON.stringify(s2.body.sessions));
 
   // /usage 应包含子代理对账行（sub1/sub2/live-sub 共 3 个子代理会话）
-  const usageText = commands[0].handler().text;
+  const usageText = (await commands[0].handler()).text;
   check("C5 /usage 含子代理对账行",
     usageText.includes("其中子代理会话") && usageText.includes("3 个会话"),
     usageText.split("\n")[1] || "");
@@ -353,6 +371,129 @@ const TODAY_KEY = localDayKey(today);
   scope.watchFn();
   const s = await call("/token-stats/summary");
   check("D6 keepDays 变更后接口正常", s.status === 200 && s.body.total.requests === 3);
+
+  rmSync(tmp, { recursive: true, force: true });
+}
+
+// ── 测试 E：费用估算（前缀匹配 / 用户覆盖价 / 未计价降级 / history 费用） ─────
+{
+  const tmp = mkdtempSync(join(tmpdir(), "token-stats-testE-"));
+  const storagePath = join(tmp, "storages", "token-stats.json");
+  process.env.DSH_HOME = tmp;
+
+  const { ctx, routes, commands, emit } = makeCtx();
+  plugin.apply(ctx, {
+    storagePath,
+    // 用户覆盖 deepseek-v4-flash：input 3 / output 6；cacheRead 继承内置 0.05，
+    // cacheWrite 继承 input=3，reasoning 继承 output=6
+    prices: { "deepseek-v4-flash": { input: 3, output: 6 } }
+  });
+  // 带日期后缀的模型名走前缀匹配（deepseek-v4-flash-0731 / DeepSeek-V4-Flash-0731）
+  emit(usageEv("tokenrhythm", "deepseek-v4-flash-0731", { inputTokens: 1_000_000, cacheReadTokens: 1_000_000, outputTokens: 1_000_000, reasoningTokens: 500_000 }, today));
+  emit(usageEv("modlens-maofei", "DeepSeek-V4-Flash-0731", { inputTokens: 1_000_000, outputTokens: 100_000 }, today));
+  // 无价格模型：gpt-5.6-luna → cost null / unpriced 计数
+  emit(usageEv("openai", "gpt-5.6-luna", { inputTokens: 1_000_000, outputTokens: 1_000_000 }, today));
+  await new Promise((r) => setTimeout(r, 2600));
+
+  const call = async (url) => {
+    const route = routes[0];
+    const req = { url };
+    let status = 0, body = "";
+    const res = { writeHead: (s) => { status = s; }, end: (b) => { body = b; } };
+    await route.handler(req, res);
+    return { status, body: JSON.parse(body) };
+  };
+
+  const s = await call("/token-stats/summary");
+  const costFlash = (1_000_000 * 3 + 1_000_000 * 0.05 + 1_000_000 * 6 + 500_000 * 6) / 1e6; // 12.05
+  const costFlash2 = (1_000_000 * 3 + 100_000 * 6) / 1e6; // 3.6
+  const expected = costFlash + costFlash2; // 15.65
+  const flashModels = Object.values(s.body.providers["tokenrhythm"].models);
+  check("E1 前缀匹配 + 覆盖价（cost 精确）",
+    s.body.total.cost !== null && Math.abs(s.body.total.cost - expected) < 1e-9 &&
+      s.body.total.unpriced === 1 &&
+      Math.abs(flashModels[0].cost - costFlash) < 1e-9 &&
+      Math.abs(Object.values(s.body.providers["modlens-maofei"].models)[0].cost - costFlash2) < 1e-9,
+    JSON.stringify({ total: s.body.total.cost, unpriced: s.body.total.unpriced, flashModels }));
+
+  const luna = Object.values(s.body.providers["openai"].models)[0];
+  check("E2 无价格模型 cost=null（未计价）", luna.cost === null && s.body.total.unpriced === 1, JSON.stringify(luna));
+
+  const h = await call("/token-stats/history?days=1");
+  check("E3 history 每日费用", h.body.days[0].total.cost !== null &&
+    Math.abs(h.body.days[0].total.cost - expected) < 1e-9, JSON.stringify(h.body.days[0].total));
+
+  const usage = await commands[0].handler();
+  check("E4 /usage 含估算费用与未计价提示",
+    usage.text.includes(`估算费用：¥${expected.toFixed(2)}`) && usage.text.includes("1 个模型未计价"),
+    usage.text.split("\n").find((l) => l.startsWith("估算费用")) || "");
+
+  rmSync(tmp, { recursive: true, force: true });
+}
+
+// ── 测试 F：官方余额路由（mock credentials + mock fetch，端到端） ────────────
+{
+  const tmp = mkdtempSync(join(tmpdir(), "token-stats-testF-"));
+  const storagePath = join(tmp, "storages", "token-stats.json");
+  process.env.DSH_HOME = tmp;
+
+  // mock global fetch：/user/balance 返回固定余额
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => ({
+    ok: true,
+    status: 200,
+    async text() {
+      return JSON.stringify({
+        is_available: true,
+        balance_infos: [
+          { currency: "CNY", total_balance: "88.50", granted_balance: "0.00", topped_up_balance: "88.50" },
+          { currency: "USD", total_balance: "0.00", granted_balance: "0.00", topped_up_balance: "0.00" }
+        ]
+      });
+    },
+    async json() {
+      return JSON.parse(await this.text());
+    }
+  });
+
+  try {
+    const ctx1 = makeCtx();
+    // mock 场景 1：有 credentials（resolve 返回 DEEPSEEK_API_KEY）
+    ctx1.ctx.get = (name) => (name === "credentials" ? { resolve: async () => ({ value: "sk-test" }) } : undefined);
+    plugin.apply(ctx1.ctx, { storagePath });
+    const routes1 = ctx1.routes;
+    const call1 = async (url) => {
+      const req = { url };
+      let status = 0, body = "";
+      const res = { writeHead: (s) => { status = s; }, end: (b) => { body = b; } };
+      await routes1[0].handler(req, res);
+      return { status, body: JSON.parse(body) };
+    };
+    const b1 = await call1("/token-stats/balance");
+    check("F1 官方余额（mock 响应：CNY 合计 88.50）",
+      b1.status === 200 && b1.body.ok === true && b1.body.currency === "CNY" && Math.abs(b1.body.total - 88.5) < 1e-9 && b1.body.isAvailable === true,
+      JSON.stringify(b1.body));
+    const b1b = await call1("/token-stats/balance");
+    check("F2 余额 60s 缓存（第二次不重新 fetch）", b1b.status === 200 && b1b.body.fetchedAt === b1.body.fetchedAt);
+
+    // mock 场景 2：无 API key
+    const ctx2 = makeCtx();
+    ctx2.ctx.get = (name) => (name === "credentials" ? { resolve: async () => undefined } : undefined);
+    plugin.apply(ctx2.ctx, { storagePath: join(tmp, "storages", "b.json") });
+    const routes2 = ctx2.routes;
+    const call2 = async (url) => {
+      const req = { url };
+      let status = 0, body = "";
+      const res = { writeHead: (s) => { status = s; }, end: (b) => { body = b; } };
+      await routes2[0].handler(req, res);
+      return { status, body: JSON.parse(body) };
+    };
+    const b2 = await call2("/token-stats/balance");
+    check("F3 未配置 DEEPSEEK_API_KEY → no-api-key（200 降级，不 5xx）",
+      b2.status === 200 && b2.body.ok === false && b2.body.error === "no-api-key", JSON.stringify(b2.body));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 
   rmSync(tmp, { recursive: true, force: true });
 }
